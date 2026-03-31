@@ -177,6 +177,40 @@ async function main() {
     loadClaudeMdFiles(cwd),
   ])
 
+  // --- Non-interactive --print mode ---
+  const printIdx = args.indexOf('--print')
+  if (printIdx !== -1) {
+    let prompt = args[printIdx + 1]
+    if (!prompt || prompt.startsWith('--')) {
+      // Read from stdin
+      const chunks: Buffer[] = []
+      for await (const chunk of process.stdin) chunks.push(chunk as Buffer)
+      prompt = Buffer.concat(chunks).toString('utf-8').trim()
+    }
+    if (!prompt) {
+      console.error('No prompt provided')
+      process.exit(1)
+    }
+
+    const deferredToolNames = tools.deferredTools().map(t => t.name)
+    const systemPrompt = buildSystemPrompt({ cwd, gitContext, claudeMd, memoryIndex, deferredToolNames })
+    const printMessages: Message[] = [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
+
+    for await (const event of agentLoop({
+      provider,
+      model,
+      messages: printMessages,
+      tools,
+      systemPrompt,
+      toolContext: { cwd },
+      permissionCheck: undefined, // no interactive prompts in print mode
+    })) {
+      if (event.type === 'text_delta') process.stdout.write(event.text)
+    }
+    process.stdout.write('\n')
+    process.exit(0)
+  }
+
   let messages: Message[] = []
 
   // --- Session Resume or Create ---
@@ -276,6 +310,7 @@ async function main() {
 
     // --- Slash commands ---
     if (input === '/exit' || input === '/quit') {
+      await sessionManager.flush()
       console.log(chalk.dim('  bye.'))
       process.exit(0)
     }
@@ -434,6 +469,14 @@ async function main() {
         abortSignal: abortController.signal,
         toolContext: { cwd },
         permissionCheck: (toolName, toolInput) => permissionManager.check(toolName, toolInput),
+        onCompact: async (msgs) => {
+          const result = await contextManager.compact(msgs, provider, model)
+          if (result.compacted) {
+            console.log(chalk.yellow('  (context compacted)'))
+            return result.messages
+          }
+          return msgs
+        },
       })
 
       let lastWasText = false
@@ -499,7 +542,8 @@ async function main() {
     rl.prompt()
   })
 
-  rl.on('close', () => {
+  rl.on('close', async () => {
+    await sessionManager.flush()
     console.log(chalk.dim('\n  bye.'))
     process.exit(0)
   })

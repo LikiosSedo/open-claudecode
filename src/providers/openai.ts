@@ -10,45 +10,7 @@ import type {
   Provider, ProviderOptions, Message, ToolSchema,
   StreamEvent, StopReason,
 } from './types.js'
-
-// -- Retry helpers (design from Claude Code's withRetry.ts) --
-
-const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 529])
-const BASE_DELAY_MS = 500
-
-function isRetryableError(err: unknown): boolean {
-  if (err && typeof err === 'object' && 'status' in err) {
-    const status = (err as { status: number }).status
-    return RETRYABLE_STATUS_CODES.has(status)
-  }
-  if (err instanceof Error) {
-    const msg = err.message
-    if (msg.includes('ECONNRESET') || msg.includes('EPIPE') || msg.includes('fetch failed')) {
-      return true
-    }
-  }
-  return false
-}
-
-function getRetryAfterMs(err: unknown): number | null {
-  if (err && typeof err === 'object' && 'headers' in err) {
-    const headers = (err as { headers?: { get?: (k: string) => string | null } }).headers
-    const value = headers?.get?.('retry-after')
-    if (value) {
-      const seconds = parseInt(value, 10)
-      if (!isNaN(seconds)) return seconds * 1000
-    }
-  }
-  return null
-}
-
-function getBackoffDelay(attempt: number, lastError?: unknown): number {
-  const retryAfterMs = getRetryAfterMs(lastError)
-  if (retryAfterMs !== null) return Math.min(retryAfterMs, 30_000)
-  const baseDelay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt - 1), 30_000)
-  const jitter = Math.random() * 0.25 * baseDelay
-  return baseDelay + jitter
-}
+import { isRetryableError, getBackoffDelay, MAX_RETRIES } from './retry.js'
 
 export class OpenAIProvider implements Provider {
   readonly name: string
@@ -79,12 +41,11 @@ export class OpenAIProvider implements Provider {
     }))
 
     // Retry loop: retry on transient errors before consuming the stream
-    const maxRetries = 3
     let lastError: unknown
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
         const delay = getBackoffDelay(attempt, lastError)
-        console.error(`[${this.name}] Retry ${attempt}/${maxRetries} after ${Math.round(delay)}ms`)
+        console.error(`[${this.name}] Retry ${attempt}/${MAX_RETRIES} after ${Math.round(delay)}ms`)
         await new Promise(r => setTimeout(r, delay))
       }
 
@@ -100,7 +61,7 @@ export class OpenAIProvider implements Provider {
         })
       } catch (err) {
         lastError = err
-        if (!isRetryableError(err) || attempt >= maxRetries) throw err
+        if (!isRetryableError(err) || attempt >= MAX_RETRIES) throw err
         continue
       }
 
@@ -153,13 +114,12 @@ export class OpenAIProvider implements Provider {
         const finishReason = chunk.choices[0]?.finish_reason
         if (finishReason) {
           // Emit tool_use_stop for the last tracked tool (if any)
-          if (lastToolIndex >= 0) {
-            const last = toolCalls.get(lastToolIndex)
-            if (last) {
-              let input: unknown
-              try { input = JSON.parse(last.args || '{}') } catch { input = {} }
-              yield { type: 'tool_use_stop', id: last.id, input }
-            }
+          if (lastToolIndex >= 0 && toolCalls.has(lastToolIndex)) {
+            const last = toolCalls.get(lastToolIndex)!
+            let input: unknown
+            try { input = JSON.parse(last.args || '{}') } catch { input = {} }
+            yield { type: 'tool_use_stop', id: last.id, input }
+            toolCalls.delete(lastToolIndex)  // Prevent duplicate stop if already emitted by next-tool-start
           }
 
           const usage = chunk.usage

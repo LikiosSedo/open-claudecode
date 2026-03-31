@@ -15,6 +15,7 @@ export type StreamEvent =
   | { type: 'tool_use_start'; id: string; name: string }
   | { type: 'tool_use_delta'; id: string; partialJson: string }
   | { type: 'tool_use_stop'; id: string; input: unknown }
+  | { type: 'thinking_stop'; signature: string }
   | { type: 'message_stop'; stopReason: StopReason; usage?: TokenUsage }
 
 export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence'

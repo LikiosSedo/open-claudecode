@@ -394,6 +394,19 @@ export async function* agentLoop(
           break
         }
 
+        case 'thinking_stop': {
+          // Flush thinking with signature from provider
+          if (currentThinking) {
+            contentBlocks.push({
+              type: 'thinking',
+              thinking: currentThinking,
+              signature: event.signature,
+            })
+            currentThinking = ''
+          }
+          break
+        }
+
         case 'tool_use_start': {
           // Flush accumulated text/thinking before the tool_use block
           if (currentText) {
@@ -401,7 +414,9 @@ export async function* agentLoop(
             currentText = ''
           }
           if (currentThinking) {
-            contentBlocks.push({ type: 'thinking', thinking: currentThinking })
+            // Fallback: thinking_stop should have flushed this already.
+            // If we get here, signature was never received (e.g. interrupted stream).
+            contentBlocks.push({ type: 'thinking', thinking: currentThinking, signature: '' })
             currentThinking = ''
           }
           pendingToolBlocks.set(event.id, { name: event.name, partialJson: '' })
@@ -463,7 +478,9 @@ export async function* agentLoop(
       contentBlocks.push({ type: 'text', text: currentText })
     }
     if (currentThinking) {
-      contentBlocks.push({ type: 'thinking', thinking: currentThinking })
+      // Fallback: thinking_stop should have flushed this already.
+      // If we get here, the stream was interrupted before thinking_stop arrived.
+      contentBlocks.push({ type: 'thinking', thinking: currentThinking, signature: '' })
     }
 
     // -- 2. Build assistant message --
@@ -509,18 +526,27 @@ export async function* agentLoop(
     }
 
     totalUsage = addUsage(totalUsage, turnUsage)
+    yield { type: 'turn_complete', stopReason, usage: turnUsage }
 
     // -- 4. Check if we should continue --
     if (abortSignal?.aborted) {
       break
     }
 
-    if (stopReason !== 'tool_use' || !hasToolUse) {
-      yield { type: 'turn_complete', stopReason, usage: turnUsage }
+    if (stopReason === 'tool_use' && hasToolUse) {
+      // Tool loop continues — fall through to compaction + next turn
+    } else if (stopReason === 'max_tokens' && turn < maxTurns - 1) {
+      // Auto-continue: output was truncated by max_tokens.
+      // Inject a continuation prompt so the model resumes where it left off.
+      // Design from Claude Code: query.ts auto-continue on max_tokens.
+      messages.push({
+        role: 'user',
+        content: [{ type: 'text', text: 'Please continue exactly where you left off.' }],
+      })
+    } else {
+      // end_turn, stop_sequence, or budget exhausted — stop the loop
       break
     }
-
-    yield { type: 'turn_complete', stopReason, usage: turnUsage }
 
     // -- 5. Context compaction hook (cf. Claude Code autocompact) --
     if (options.onCompact) {

@@ -130,7 +130,7 @@ Use this for:
 The sub-agent cannot see the parent conversation — provide all necessary context in the prompt.`,
 
   inputSchema,
-  isConcurrencySafe: false,
+  isConcurrencySafe: true,  // Sub-agents are isolated (own messages, own abort) — safe to run in parallel
   isReadOnly: false,
 
   async execute(input: Input, context: ToolContext): Promise<ToolResult> {

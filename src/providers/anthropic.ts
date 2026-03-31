@@ -12,47 +12,7 @@ import type {
   Provider, ProviderOptions, Message, ToolSchema,
   StreamEvent, TokenUsage, StopReason,
 } from './types.js'
-
-// -- Retry helpers (design from Claude Code's withRetry.ts) --
-
-const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 529])
-const BASE_DELAY_MS = 500
-
-function isRetryableError(err: unknown): boolean {
-  if (err && typeof err === 'object' && 'status' in err) {
-    const status = (err as { status: number }).status
-    return RETRYABLE_STATUS_CODES.has(status)
-  }
-  if (err instanceof Error) {
-    const msg = err.message
-    if (msg.includes('ECONNRESET') || msg.includes('EPIPE') || msg.includes('fetch failed')) {
-      return true
-    }
-  }
-  return false
-}
-
-function getRetryAfterMs(err: unknown): number | null {
-  if (err && typeof err === 'object' && 'headers' in err) {
-    const headers = (err as { headers?: { get?: (k: string) => string | null } }).headers
-    const value = headers?.get?.('retry-after')
-    if (value) {
-      const seconds = parseInt(value, 10)
-      if (!isNaN(seconds)) return seconds * 1000
-    }
-  }
-  return null
-}
-
-function getBackoffDelay(attempt: number, lastError?: unknown): number {
-  // Honor retry-after header from the server (e.g. 429 responses)
-  const retryAfterMs = getRetryAfterMs(lastError)
-  if (retryAfterMs !== null) return Math.min(retryAfterMs, 30_000)
-  // Exponential backoff with proportional jitter (cf. Claude Code: 500ms * 2^(attempt-1))
-  const baseDelay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt - 1), 30_000)
-  const jitter = Math.random() * 0.25 * baseDelay
-  return baseDelay + jitter
-}
+import { isRetryableError, getBackoffDelay, MAX_RETRIES } from './retry.js'
 
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic'
@@ -99,12 +59,11 @@ export class AnthropicProvider implements Provider {
     }))
 
     // Retry loop: retry on transient errors before consuming the stream
-    const maxRetries = 3
     let lastError: unknown
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
         const delay = getBackoffDelay(attempt, lastError)
-        console.error(`[anthropic] Retry ${attempt}/${maxRetries} after ${Math.round(delay)}ms`)
+        console.error(`[anthropic] Retry ${attempt}/${MAX_RETRIES} after ${Math.round(delay)}ms`)
         await new Promise(r => setTimeout(r, delay))
       }
 
@@ -121,7 +80,7 @@ export class AnthropicProvider implements Provider {
         })
       } catch (err) {
         lastError = err
-        if (!isRetryableError(err) || attempt >= maxRetries) throw err
+        if (!isRetryableError(err) || attempt >= MAX_RETRIES) throw err
         continue
       }
 
@@ -186,6 +145,8 @@ export class AnthropicProvider implements Provider {
             } else if (delta.type === 'thinking_delta') {
               partial.thinking += delta.thinking
               yield { type: 'thinking_delta', thinking: delta.thinking }
+            } else if (delta.type === 'signature_delta') {
+              if (partial) partial.signature = delta.signature
             }
             break
           }
@@ -194,7 +155,9 @@ export class AnthropicProvider implements Provider {
             const partial = partialBlocks.get(event.index)
             if (!partial) break
 
-            if (partial.type === 'tool_use' && partial.id) {
+            if (partial.type === 'thinking' && partial.signature) {
+              yield { type: 'thinking_stop', signature: partial.signature }
+            } else if (partial.type === 'tool_use' && partial.id) {
               let input: unknown
               try { input = JSON.parse(partial.input || '{}') } catch { input = {} }
               yield { type: 'tool_use_stop', id: partial.id, input }

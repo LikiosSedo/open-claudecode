@@ -38,6 +38,7 @@ export interface SessionInfo {
 export class SessionManager {
   private sessionDir: string
   private _currentSessionId: string | null = null
+  private _pendingWrite: Promise<void> = Promise.resolve()
 
   constructor(options?: { sessionDir?: string }) {
     this.sessionDir = options?.sessionDir ?? join(homedir(), '.occ', 'sessions')
@@ -87,7 +88,14 @@ export class SessionManager {
       }
       return JSON.stringify(entry)
     })
-    await appendFile(filePath, lines.join('\n') + '\n', { mode: 0o600 })
+    const writeOp = appendFile(filePath, lines.join('\n') + '\n', { mode: 0o600 })
+    this._pendingWrite = this._pendingWrite.then(() => writeOp, () => writeOp)
+    await writeOp
+  }
+
+  /** Wait for any pending writes to complete. Call before exit to avoid data loss. */
+  async flush(): Promise<void> {
+    await this._pendingWrite
   }
 
   /** Load all messages from a session file. */

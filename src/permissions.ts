@@ -238,9 +238,23 @@ export class PermissionManager {
         return analyzeBashCommand(command)
       }
 
-      default:
+      case 'Agent':
+        return { behavior: 'allow' }  // Sub-agents inherit parent's permission policy
+
+      case 'Memory':
+        return { behavior: 'allow' }  // Memory save/list/delete are user-visible
+
+      case 'ToolSearch':
+        return { behavior: 'allow' }  // Read-only: just fetches tool schemas
+
+      default: {
+        // MCP tools: ask with descriptive message
+        if (toolName.startsWith('mcp__')) {
+          return { behavior: 'ask', message: `MCP tool: ${toolName}` }
+        }
         // Unknown tool — ask to be safe
         return { behavior: 'ask', message: `Unknown tool: ${toolName}` }
+      }
     }
   }
 }
