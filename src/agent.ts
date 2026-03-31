@@ -24,6 +24,7 @@ import type {
   ToolRegistry,
   ToolContext,
   ToolResult,
+  PermissionDecision,
 } from './tools/types.js'
 
 // -- AgentEvent: unified event stream yielded by agentLoop() --
@@ -72,6 +73,17 @@ export class StreamingToolExecutor {
       this.aborted = true
       this.wake()
     }, { once: true })
+  }
+
+  /** Add a tool that was denied by permission check. Immediately completed with error. */
+  addDeniedTool(id: string, name: string, reason: string): void {
+    this.tools.push({
+      id, name, input: {}, tool: undefined,
+      status: 'completed',
+      isConcurrencySafe: true,
+      result: { output: reason, isError: true },
+    })
+    this.wake()
   }
 
   /** Add tool to queue. Called on tool_use_stop while model still streams. */
@@ -307,6 +319,12 @@ export interface AgentLoopOptions {
   toolContext?: ToolContext
   /** Context compaction callback. Implementation is external (cf. Claude Code autocompact). */
   onCompact?: (messages: Message[]) => Promise<Message[]>
+  /**
+   * Permission check callback. Called before each tool execution.
+   * If absent, all tools are allowed (backward-compatible).
+   * The callback handles ask/deny logic internally (may prompt user).
+   */
+  permissionCheck?: (toolName: string, input: Record<string, unknown>) => Promise<PermissionDecision>
 }
 
 /**
@@ -324,6 +342,7 @@ export async function* agentLoop(
     maxTokens,
     temperature,
     abortSignal,
+    permissionCheck,
   } = options
 
   const systemPrompt = options.systemPrompt
@@ -386,14 +405,25 @@ export async function* agentLoop(
         }
 
         case 'tool_use_stop': {
-          // Critical optimization: feed to executor while model still streams
           const input = event.input as Record<string, unknown>
           const toolName = pendingToolBlocks.get(event.id)?.name ?? 'unknown'
           pendingToolBlocks.delete(event.id)
 
           contentBlocks.push({ type: 'tool_use', id: event.id, name: toolName, input })
-          executor.addTool(event.id, toolName, input)
 
+          // Permission check before execution (async — may prompt user)
+          if (permissionCheck) {
+            const decision = await permissionCheck(toolName, input)
+            if (decision.behavior === 'deny') {
+              // Feed a pre-denied result into executor
+              executor.addDeniedTool(event.id, toolName, `Permission denied: ${decision.reason}`)
+              yield { type: 'tool_start', name: toolName, id: event.id }
+              break
+            }
+            // 'allow' falls through to normal execution
+          }
+
+          executor.addTool(event.id, toolName, input)
           yield { type: 'tool_start', name: toolName, id: event.id }
           break
         }

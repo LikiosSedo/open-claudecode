@@ -45,10 +45,12 @@ export class OpenAIProvider implements Provider {
       messages: openaiMessages,
       tools: openaiTools.length > 0 ? openaiTools : undefined,
       stream: true,
+      stream_options: { include_usage: true },
     })
 
     // Track tool call accumulation (OpenAI streams tool calls differently)
     const toolCalls = new Map<number, { id: string; name: string; args: string }>()
+    let lastToolIndex = -1
 
     yield { type: 'message_start', messageId: '' }
 
@@ -65,10 +67,22 @@ export class OpenAIProvider implements Provider {
       if (delta.tool_calls) {
         for (const tc of delta.tool_calls) {
           const idx = tc.index
+
+          // When a new tool_call starts, stop the previous one
+          if (!toolCalls.has(idx) && idx > lastToolIndex && lastToolIndex >= 0) {
+            const prev = toolCalls.get(lastToolIndex)
+            if (prev) {
+              let input: unknown
+              try { input = JSON.parse(prev.args || '{}') } catch { input = {} }
+              yield { type: 'tool_use_stop', id: prev.id, input }
+            }
+          }
+
           if (!toolCalls.has(idx)) {
             const id = tc.id ?? `call_${idx}`
             const name = tc.function?.name ?? ''
             toolCalls.set(idx, { id, name, args: '' })
+            lastToolIndex = idx
             yield { type: 'tool_use_start', id, name }
           }
           const tracked = toolCalls.get(idx)!
@@ -82,11 +96,14 @@ export class OpenAIProvider implements Provider {
       // Finish
       const finishReason = chunk.choices[0]?.finish_reason
       if (finishReason) {
-        // Emit completed tool_use_stop for all tracked tools
-        for (const [, tc] of toolCalls) {
-          let input: unknown
-          try { input = JSON.parse(tc.args || '{}') } catch { input = {} }
-          yield { type: 'tool_use_stop', id: tc.id, input }
+        // Emit tool_use_stop for the last tracked tool (if any)
+        if (lastToolIndex >= 0) {
+          const last = toolCalls.get(lastToolIndex)
+          if (last) {
+            let input: unknown
+            try { input = JSON.parse(last.args || '{}') } catch { input = {} }
+            yield { type: 'tool_use_stop', id: last.id, input }
+          }
         }
 
         const usage = chunk.usage

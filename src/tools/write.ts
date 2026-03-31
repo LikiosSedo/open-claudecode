@@ -7,7 +7,7 @@
  */
 
 import { z } from 'zod'
-import { writeFile, mkdir } from 'fs/promises'
+import { writeFile, mkdir, access } from 'fs/promises'
 import { resolve, dirname } from 'path'
 import type { Tool, ToolContext, ToolResult } from './types.js'
 
@@ -29,10 +29,13 @@ Parent directories are created automatically.`,
   async execute(input: Input, context: ToolContext): Promise<ToolResult> {
     const filePath = resolve(context.cwd, input.file_path)
     try {
+      let existed = false
+      try { await access(filePath); existed = true } catch { /* does not exist */ }
       await mkdir(dirname(filePath), { recursive: true })
       await writeFile(filePath, input.content, 'utf-8')
       const lines = input.content.split('\n').length
-      return { output: `File written: ${filePath} (${lines} lines)` }
+      const suffix = existed ? ' (overwritten)' : ''
+      return { output: `File written: ${filePath} (${lines} lines)${suffix}` }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
       return { output: `Error writing file: ${msg}`, isError: true }

@@ -9,6 +9,7 @@
  */
 
 import { z } from 'zod'
+import { zodToJsonSchema as zodToJson } from 'zod-to-json-schema'
 
 // --- Core Tool Interface ---
 
@@ -36,6 +37,9 @@ export interface Tool<TInput = unknown> {
 
   /** Does this tool only read, never write? */
   isReadOnly: boolean
+
+  /** Pre-computed JSON Schema (used by MCP tools that already have JSON Schema) */
+  rawJsonSchema?: Record<string, unknown>
 }
 
 export interface ToolContext {
@@ -81,52 +85,15 @@ export class ToolRegistry {
     return this.all().map(t => ({
       name: t.name,
       description: t.description,
-      inputSchema: this.zodToJsonSchema(t.inputSchema),
+      inputSchema: t.rawJsonSchema ?? this.zodToJsonSchema(t.inputSchema),
     }))
   }
 
-  /** Convert Zod schema to JSON Schema (synchronous, cached) */
+  /** Convert Zod schema to JSON Schema */
   zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
-    // Manual conversion for common Zod types — avoids ESM dynamic import issues
-    // For full coverage, install zod-to-json-schema and replace this method
-    return this.zodToJsonSchemaSimple(schema)
-  }
-
-  private zodToJsonSchemaSimple(schema: z.ZodType): Record<string, unknown> {
-    const def = (schema as { _def?: Record<string, unknown> })._def
-    if (!def) return { type: 'object' }
-
-    const typeName = def.typeName as string
-
-    if (typeName === 'ZodObject') {
-      const shape = (schema as z.ZodObject<z.ZodRawShape>).shape
-      const properties: Record<string, unknown> = {}
-      const required: string[] = []
-
-      for (const [key, value] of Object.entries(shape)) {
-        const fieldSchema = value as z.ZodType
-        const fieldDef = (fieldSchema as { _def?: Record<string, unknown> })._def
-        const isOptional = (fieldDef?.typeName as string) === 'ZodOptional'
-        const innerSchema = isOptional ? (fieldDef?.innerType as z.ZodType) : fieldSchema
-        properties[key] = this.zodToJsonSchemaSimple(innerSchema)
-
-        // Add description from .describe()
-        const desc = (fieldDef?.description ?? (innerSchema as { _def?: Record<string, unknown> })._def?.description) as string | undefined
-        if (desc && typeof properties[key] === 'object') {
-          (properties[key] as Record<string, unknown>).description = desc
-        }
-
-        if (!isOptional) required.push(key)
-      }
-
-      return { type: 'object', properties, ...(required.length > 0 ? { required } : {}) }
-    }
-
-    if (typeName === 'ZodString') return { type: 'string' }
-    if (typeName === 'ZodNumber') return { type: 'number' }
-    if (typeName === 'ZodBoolean') return { type: 'boolean' }
-    if (typeName === 'ZodOptional') return this.zodToJsonSchemaSimple(def.innerType as z.ZodType)
-
-    return { type: 'object' }
+    const result = zodToJson(schema, { target: 'openApi3' })
+    // Remove top-level $schema and $ref wrappers if present
+    const { $schema, ...rest } = result as Record<string, unknown>
+    return rest
   }
 }

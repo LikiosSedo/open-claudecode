@@ -25,6 +25,8 @@ import { GrepTool } from './tools/grep.js'
 import { agentLoop } from './agent.js'
 import { buildSystemPrompt, getGitContext } from './prompt.js'
 import { ContextManager } from './context.js'
+import { MCPManager, loadMCPConfig } from './mcp.js'
+import { PermissionManager, type PermissionMode } from './permissions.js'
 
 // --- Provider Selection ---
 
@@ -76,6 +78,37 @@ function formatUsage(): string {
 
 // --- Main ---
 
+// --- Permission Prompt ---
+
+/** Prompt user for permission confirmation via readline. */
+function createPermissionPrompter(rl: readline.Interface) {
+  return async (toolName: string, input: Record<string, unknown>, message: string): Promise<boolean> => {
+    // Format a concise summary of what the tool wants to do
+    let detail = ''
+    if (toolName === 'Bash' && typeof input.command === 'string') {
+      const cmd = input.command.length > 120 ? input.command.slice(0, 120) + '...' : input.command
+      detail = `  command: ${cmd}`
+    } else if (typeof input.file_path === 'string') {
+      detail = `  path: ${input.file_path}`
+    }
+
+    console.log()
+    console.log(chalk.yellow(`  Permission required: ${toolName}`))
+    if (detail) console.log(chalk.yellow(detail))
+    console.log(chalk.dim(`  reason: ${message}`))
+
+    return new Promise<boolean>((resolve) => {
+      rl.question(chalk.yellow('  Allow? [y/N] '), (answer) => {
+        const allowed = answer.trim().toLowerCase() === 'y'
+        if (!allowed) {
+          console.log(chalk.red('  denied.'))
+        }
+        resolve(allowed)
+      })
+    })
+  }
+}
+
 async function main() {
   const { provider, defaultModel } = createProvider()
   let model = process.env.OCC_MODEL ?? defaultModel
@@ -83,17 +116,46 @@ async function main() {
   const tools = createToolRegistry()
   const contextManager = new ContextManager()
 
+  // --- Permission Mode ---
+  const args = process.argv.slice(2)
+  let permissionMode: PermissionMode = 'auto'
+  if (args.includes('--bypass-permissions')) {
+    permissionMode = 'bypass'
+  } else if (args.includes('--ask-permissions')) {
+    permissionMode = 'ask'
+  }
+
+  // --- MCP Integration ---
+  let mcpManager: MCPManager | null = null
+  const mcpConfigs = loadMCPConfig()
+  if (mcpConfigs.length > 0) {
+    mcpManager = new MCPManager()
+    await mcpManager.connect(mcpConfigs)
+    for (const tool of mcpManager.getTools()) {
+      tools.register(tool)
+    }
+    // Cleanup on exit
+    process.on('beforeExit', () => mcpManager?.disconnect())
+  }
+
   // Pre-fetch git context once per session (design from Claude Code: memoized per session)
   const gitContext = await getGitContext(cwd)
 
   let messages: Message[] = []
 
   // Welcome
+  const mcpStatus = mcpManager?.getStatus() ?? []
+  const mcpToolCount = mcpStatus.reduce((sum, s) => sum + s.toolCount, 0)
   console.log()
   console.log(chalk.bold('  open-claude-code') + chalk.dim(' — the essence of Claude Code'))
   console.log(chalk.dim(`  provider: ${provider.name} | model: ${model}`))
   console.log(chalk.dim(`  cwd: ${cwd}`))
   console.log(chalk.dim(`  tools: ${tools.all().map(t => t.name).join(', ')}`))
+  if (mcpToolCount > 0) {
+    console.log(chalk.dim(`  mcp: ${mcpStatus.length} server(s), ${mcpToolCount} tool(s)`))
+  }
+  const modeLabel = permissionMode === 'bypass' ? chalk.red(permissionMode) : chalk.green(permissionMode)
+  console.log(chalk.dim('  permissions: ') + modeLabel)
   console.log(chalk.dim('  type /help for commands'))
   console.log()
 
@@ -101,6 +163,12 @@ async function main() {
     input: process.stdin,
     output: process.stdout,
     prompt: chalk.cyan('occ> '),
+  })
+
+  // --- Permission Manager (needs rl for interactive prompts) ---
+  const permissionManager = new PermissionManager({
+    mode: permissionMode,
+    askUser: createPermissionPrompter(rl),
   })
 
   rl.prompt()
@@ -151,16 +219,52 @@ async function main() {
       rl.prompt()
       return
     }
+    if (input === '/mcp') {
+      const status = mcpManager?.getStatus() ?? []
+      if (status.length === 0) {
+        console.log(chalk.yellow('  No MCP servers connected.'))
+        console.log(chalk.dim('  Configure servers in ~/.occ/mcp.json or set OCC_MCP_CONFIG'))
+      } else {
+        for (const server of status) {
+          console.log(chalk.cyan(`  ${server.name}`) + chalk.dim(` (${server.toolCount} tools)`))
+          for (const toolName of server.tools) {
+            console.log(chalk.dim(`    - ${toolName}`))
+          }
+        }
+      }
+      rl.prompt()
+      return
+    }
+    if (input.startsWith('/permissions')) {
+      const newMode = input.slice('/permissions'.length).trim()
+      if (newMode === 'auto' || newMode === 'ask' || newMode === 'bypass') {
+        permissionManager.setMode(newMode)
+        const label = newMode === 'bypass' ? chalk.red(newMode) : chalk.green(newMode)
+        console.log(chalk.yellow(`  permissions → `) + label)
+      } else if (newMode) {
+        console.log(chalk.red(`  Unknown mode: ${newMode}. Use auto, ask, or bypass.`))
+      } else {
+        const currentMode = permissionManager.getMode()
+        const label = currentMode === 'bypass' ? chalk.red(currentMode) : chalk.green(currentMode)
+        console.log(chalk.yellow('  permissions: ') + label)
+        console.log(chalk.dim('  modes: auto (smart per-tool), ask (confirm all), bypass (allow all)'))
+      }
+      rl.prompt()
+      return
+    }
     if (input === '/help') {
-      console.log(chalk.dim('  /exit     quit'))
-      console.log(chalk.dim('  /clear    clear conversation'))
-      console.log(chalk.dim('  /model    show or switch model'))
-      console.log(chalk.dim('  /cost     show token usage'))
+      console.log(chalk.dim('  /exit        quit'))
+      console.log(chalk.dim('  /clear       clear conversation'))
+      console.log(chalk.dim('  /model       show or switch model'))
+      console.log(chalk.dim('  /cost        show token usage'))
+      console.log(chalk.dim('  /mcp         show MCP servers and tools'))
+      console.log(chalk.dim('  /permissions show or switch permission mode'))
       rl.prompt()
       return
     }
 
     // --- Agent turn ---
+    rl.pause()
     abortController = new AbortController()
 
     // Context compaction before next turn
@@ -190,6 +294,7 @@ async function main() {
         systemPrompt,
         abortSignal: abortController.signal,
         toolContext: { cwd },
+        permissionCheck: (toolName, toolInput) => permissionManager.check(toolName, toolInput),
       })
 
       let lastWasText = false
@@ -242,6 +347,7 @@ async function main() {
 
     abortController = null
     console.log()
+    rl.resume()
     rl.prompt()
   })
 

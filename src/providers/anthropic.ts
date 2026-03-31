@@ -35,7 +35,7 @@ export class AnthropicProvider implements Provider {
       content: m.content.map(c => {
         switch (c.type) {
           case 'text': return { type: 'text' as const, text: c.text }
-          case 'thinking': return { type: 'thinking' as const, thinking: c.thinking, signature: '' }
+          case 'thinking': return { type: 'thinking' as const, thinking: c.thinking, signature: c.signature ?? '' }
           case 'tool_use': return { type: 'tool_use' as const, id: c.id, name: c.name, input: c.input }
           case 'tool_result': return {
             type: 'tool_result' as const,
@@ -68,7 +68,7 @@ export class AnthropicProvider implements Provider {
     })
 
     // Track partial state for accumulation
-    const partialBlocks = new Map<number, { type: string; id?: string; name?: string; text: string; input: string; thinking: string }>()
+    const partialBlocks = new Map<number, { type: string; id?: string; name?: string; text: string; input: string; thinking: string; signature?: string }>()
 
     for await (const event of response) {
       switch (event.type) {
@@ -95,6 +95,14 @@ export class AnthropicProvider implements Provider {
             name: 'name' in block ? (block as { name: string }).name : undefined,
             text: '', input: '', thinking: '',
           })
+
+          if (block.type === 'thinking') {
+            const thinkingBlock = block as { type: string; signature?: string }
+            if (thinkingBlock.signature) {
+              const partial = partialBlocks.get(event.index)
+              if (partial) partial.signature = thinkingBlock.signature
+            }
+          }
 
           if (block.type === 'tool_use') {
             yield {

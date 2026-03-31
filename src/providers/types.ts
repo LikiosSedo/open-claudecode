@@ -46,7 +46,7 @@ export type UserContent =
 
 export type AssistantContent =
   | { type: 'text'; text: string }
-  | { type: 'thinking'; thinking: string }
+  | { type: 'thinking'; thinking: string; signature?: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
 
 // --- Tool Schema (for provider API) ---

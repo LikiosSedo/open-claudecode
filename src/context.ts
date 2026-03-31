@@ -62,7 +62,8 @@ function formatCompactSummary(raw: string): string {
 }
 
 const MAX_CONSECUTIVE_FAILURES = 3 // from Claude Code autoCompact.ts
-const MIN_RECENT_MESSAGES = 6      // preserved after truncation
+const MIN_RECENT_MESSAGES = 2      // absolute minimum preserved after truncation
+const RECENT_TOKEN_RATIO = 0.3     // preserve tail messages up to 30% of budget
 
 export class ContextManager {
   private maxTokens: number
@@ -108,9 +109,20 @@ export class ContextManager {
       return { messages, compacted: false }
     }
 
-    // Strategy 1: Truncation — keep recent messages
-    const kept = messages.slice(-MIN_RECENT_MESSAGES)
-    const dropped = messages.slice(0, -MIN_RECENT_MESSAGES)
+    // Strategy 1: Truncation — keep recent messages based on token budget
+    const recentTokenBudget = this.budget * RECENT_TOKEN_RATIO
+    let recentCount = 0
+    let recentTokens = 0
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const tokens = messageTokens(messages[i]!)
+      if (recentCount >= MIN_RECENT_MESSAGES && recentTokens + tokens > recentTokenBudget) break
+      recentTokens += tokens
+      recentCount++
+    }
+    recentCount = Math.max(recentCount, MIN_RECENT_MESSAGES)
+
+    const kept = messages.slice(-recentCount)
+    const dropped = messages.slice(0, -recentCount)
 
     if (dropped.length === 0) {
       // Nothing to drop — messages are all recent

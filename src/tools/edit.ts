@@ -58,7 +58,20 @@ the edit fails unless replace_all is true — provide more surrounding context t
       await writeFile(filePath, newContent, 'utf-8')
 
       const replaced = input.replace_all ? occurrences : 1
-      return { output: `Edited ${filePath}: replaced ${replaced} occurrence(s)` }
+
+      // Build a simple diff showing the change in context
+      const oldLines = input.old_string.split('\n')
+      const newLines = input.new_string.split('\n')
+      const diff = [
+        `Edited ${filePath}: replaced ${replaced} occurrence(s)`,
+        '',
+        '--- before',
+        ...oldLines.map(l => `- ${l}`),
+        '+++ after',
+        ...newLines.map(l => `+ ${l}`),
+      ].join('\n')
+
+      return { output: diff }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
       return { output: `Error editing file: ${msg}`, isError: true }

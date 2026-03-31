@@ -32,6 +32,15 @@ Use offset and limit for large files. Supports text files, not binary.`,
     const filePath = resolve(context.cwd, input.file_path)
     try {
       const content = await readFile(filePath, 'utf-8')
+
+      // Detect binary files by checking for null bytes
+      if (content.includes('\0')) {
+        return {
+          output: `Error: ${filePath} appears to be a binary file. Only text files are supported.`,
+          isError: true,
+        }
+      }
+
       const lines = content.split('\n')
       const offset = input.offset ?? 0
       const limit = input.limit ?? 2000
