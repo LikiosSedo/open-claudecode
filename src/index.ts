@@ -203,7 +203,9 @@ async function main() {
       tools,
       systemPrompt,
       toolContext: { cwd },
-      permissionCheck: undefined, // no interactive prompts in print mode
+      // --print mode: tools execute without confirmation (like --bypass-permissions).
+      // Only use in trusted contexts (local dev, CI with sandboxed env).
+      permissionCheck: undefined,
     })) {
       if (event.type === 'text_delta') process.stdout.write(event.text)
     }

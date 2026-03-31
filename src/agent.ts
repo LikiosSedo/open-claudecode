@@ -538,7 +538,7 @@ export async function* agentLoop(
     } else if (stopReason === 'max_tokens' && turn < maxTurns - 1) {
       // Auto-continue: output was truncated by max_tokens.
       // Inject a continuation prompt so the model resumes where it left off.
-      // Design from Claude Code: query.ts auto-continue on max_tokens.
+      yield { type: 'text_delta', text: '\n...continuing...\n' }
       messages.push({
         role: 'user',
         content: [{ type: 'text', text: 'Please continue exactly where you left off.' }],
