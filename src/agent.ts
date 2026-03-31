@@ -346,14 +346,27 @@ export async function* agentLoop(
   } = options
 
   const systemPrompt = options.systemPrompt
-  const toolSchemas = tools.toSchemas()
-  const toolContext: ToolContext = options.toolContext ?? { cwd: process.cwd() }
+
+  // Build ToolContext with sub-agent support fields.
+  // AgentTool.execute() reads these to create child agentLoop instances.
+  const baseContext = options.toolContext ?? { cwd: process.cwd() }
+  const toolContext: ToolContext = {
+    ...baseContext,
+    provider: baseContext.provider ?? provider,
+    tools: baseContext.tools ?? tools,
+    systemPrompt: baseContext.systemPrompt ?? systemPrompt,
+    model: baseContext.model ?? model,
+    permissionCheck: baseContext.permissionCheck ?? permissionCheck,
+    agentDepth: baseContext.agentDepth ?? 0,
+  }
 
   // Copy so the caller's array isn't mutated
   const messages: Message[] = [...options.messages]
   let totalUsage: TokenUsage = { ...EMPTY_USAGE }
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    // Recompute schemas each turn: discover() may have added deferred tools
+    const toolSchemas = tools.availableSchemas()
     const stream = provider.stream(messages, toolSchemas, { model, maxTokens, systemPrompt, temperature })
 
     const contentBlocks: AssistantContent[] = []

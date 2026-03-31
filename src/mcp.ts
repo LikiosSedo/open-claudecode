@@ -179,6 +179,12 @@ export class MCPManager {
     const client = server.client
     const originalToolName = mcpTool.name
 
+    // Extract first few words of description as searchHint for ToolSearch matching
+    const searchHint = mcpTool.description
+      .split(/\s+/)
+      .slice(0, 8)
+      .join(' ')
+
     return {
       name: qualifiedName,
       description: mcpTool.description,
@@ -186,6 +192,8 @@ export class MCPManager {
       rawJsonSchema: mcpTool.inputSchema,
       isConcurrencySafe: true,
       isReadOnly: true,
+      shouldDefer: true, // MCP tools are deferred — discoverable via ToolSearch
+      searchHint,
 
       async execute(input: unknown, _context: ToolContext): Promise<ToolResult> {
         const result = await client.callTool({

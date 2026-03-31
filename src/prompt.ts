@@ -44,6 +44,8 @@ Freely take local, reversible actions (editing files, running tests). For hard-t
    - Search files: use Glob (not find/ls)
    - Search content: use Grep (not grep/rg)
    - Use Bash only for commands that require shell execution.
+ - Use the Memory tool to save important information for future conversations (user preferences, feedback, project context, external references).
+ - Some tools are deferred and not listed in your initial tool schemas. Their names appear in <system-reminder> messages. Use the ToolSearch tool to fetch their full schemas when needed. Once fetched, they become callable like any other tool.
  - Call multiple tools in a single response when they are independent. Maximize parallel tool calls. Only sequence when there are data dependencies.
 
 # Tone and style
@@ -112,10 +114,13 @@ export function getEnvironmentContext(cwd: string): string {
 /** Build system prompt. blocks[0]=static (cacheable), blocks[1]=dynamic. */
 export function buildSystemPrompt(options: {
   cwd: string
-  gitContext?: string       // Pre-fetched via getGitContext()
-  customInstructions?: string  // User's CLAUDE.md content
+  gitContext?: string           // Pre-fetched via getGitContext()
+  customInstructions?: string   // User's CLAUDE.md content
+  claudeMd?: string             // Discovered CLAUDE.md content
+  memoryIndex?: string          // MEMORY.md index content
+  deferredToolNames?: string[]  // Names of deferred tools (for ToolSearch discovery)
 }): string[] {
-  const { cwd, gitContext, customInstructions } = options
+  const { cwd, gitContext, customInstructions, claudeMd, memoryIndex, deferredToolNames } = options
 
   // Block 0: static (cacheable)
   const staticBlock = STATIC_PROMPT
@@ -129,8 +134,22 @@ export function buildSystemPrompt(options: {
     dynamicParts.push(`# Git\n${gitContext}`)
   }
 
+  if (claudeMd?.trim()) {
+    dynamicParts.push(`# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\n${claudeMd.trim()}`)
+  }
+
   if (customInstructions?.trim()) {
     dynamicParts.push(`# User Instructions\n${customInstructions.trim()}`)
+  }
+
+  if (memoryIndex?.trim()) {
+    dynamicParts.push(`# Memory\n${memoryIndex.trim()}`)
+  }
+
+  // Deferred tools list — lets the LLM know what's available via ToolSearch
+  if (deferredToolNames && deferredToolNames.length > 0) {
+    const toolList = deferredToolNames.sort().join('\n')
+    dynamicParts.push(`<available-deferred-tools>\n${toolList}\n</available-deferred-tools>`)
   }
 
   return [staticBlock, dynamicParts.join('\n\n')]

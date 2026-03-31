@@ -10,6 +10,7 @@
 
 import { z } from 'zod'
 import { zodToJsonSchema as zodToJson } from 'zod-to-json-schema'
+import type { Provider } from '../providers/types.js'
 
 // --- Core Tool Interface ---
 
@@ -40,11 +41,33 @@ export interface Tool<TInput = unknown> {
 
   /** Pre-computed JSON Schema (used by MCP tools that already have JSON Schema) */
   rawJsonSchema?: Record<string, unknown>
+
+  /**
+   * If true, this tool's schema is deferred — not sent to LLM initially.
+   * Discoverable via ToolSearch. Design from Claude Code.
+   */
+  shouldDefer?: boolean
+
+  /** Keywords for ToolSearch matching (3-10 words) */
+  searchHint?: string
 }
 
 export interface ToolContext {
   cwd: string
   abortSignal?: AbortSignal
+  // --- Sub-agent support (populated by agentLoop for AgentTool) ---
+  /** Provider instance for sub-agent to reuse (same connection, no extra init) */
+  provider?: Provider
+  /** Tool registry for sub-agent to reuse (same tools available) */
+  tools?: ToolRegistry
+  /** System prompt blocks for sub-agent (same static+dynamic split) */
+  systemPrompt?: string | string[]
+  /** Model identifier for sub-agent (inherits parent's model by default) */
+  model?: string
+  /** Permission check callback for sub-agent (inherits parent's security policy) */
+  permissionCheck?: (toolName: string, input: Record<string, unknown>) => Promise<PermissionDecision>
+  /** Current nesting depth. 0 = root agent. Used to enforce max recursion depth. */
+  agentDepth?: number
 }
 
 export interface ToolResult {
@@ -64,10 +87,19 @@ export type PermissionChecker = (
   input: unknown,
 ) => Promise<PermissionDecision>
 
+// --- Tool Schema (as sent to the LLM) ---
+
+export interface ToolSchema {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+}
+
 // --- Tool Registry ---
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>()
+  private discoveredNames = new Set<string>()
 
   register(tool: Tool): void {
     this.tools.set(tool.name, tool)
@@ -81,7 +113,44 @@ export class ToolRegistry {
     return Array.from(this.tools.values())
   }
 
-  toSchemas(): Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> {
+  /** Get only non-deferred tools (for initial API call) */
+  activeTools(): Tool[] {
+    return this.all().filter(t => !t.shouldDefer)
+  }
+
+  /** Get only deferred tools (for ToolSearch to search) */
+  deferredTools(): Tool[] {
+    return this.all().filter(t => t.shouldDefer)
+  }
+
+  /**
+   * Mark tools as discovered — they'll be included in subsequent API calls.
+   * Effect persists until session ends (no need to re-search).
+   */
+  discover(toolNames: string[]): void {
+    for (const name of toolNames) {
+      if (this.tools.has(name)) {
+        this.discoveredNames.add(name)
+      }
+    }
+  }
+
+  /**
+   * Get schemas for active + discovered tools (sent to the LLM each turn).
+   * Deferred tools not yet discovered are excluded — saves tokens.
+   */
+  availableSchemas(): ToolSchema[] {
+    return this.all()
+      .filter(t => !t.shouldDefer || this.discoveredNames.has(t.name))
+      .map(t => ({
+        name: t.name,
+        description: t.description,
+        inputSchema: t.rawJsonSchema ?? this.zodToJsonSchema(t.inputSchema),
+      }))
+  }
+
+  /** All schemas (including deferred). Used by toSchemas() for backward compat. */
+  toSchemas(): ToolSchema[] {
     return this.all().map(t => ({
       name: t.name,
       description: t.description,

@@ -22,11 +22,15 @@ import { WriteTool } from './tools/write.js'
 import { EditTool } from './tools/edit.js'
 import { GlobTool } from './tools/glob.js'
 import { GrepTool } from './tools/grep.js'
+import { AgentTool } from './tools/agent.js'
+import { createToolSearchTool } from './tools/tool-search.js'
 import { agentLoop } from './agent.js'
 import { buildSystemPrompt, getGitContext } from './prompt.js'
 import { ContextManager } from './context.js'
 import { MCPManager, loadMCPConfig } from './mcp.js'
 import { PermissionManager, type PermissionMode } from './permissions.js'
+import { MemoryManager, loadClaudeMdFiles } from './memory.js'
+import { MemoryTool, setMemoryManager } from './tools/memory-tool.js'
 
 // --- Provider Selection ---
 
@@ -53,6 +57,8 @@ function createToolRegistry(): ToolRegistry {
   registry.register(EditTool)
   registry.register(GlobTool)
   registry.register(GrepTool)
+  registry.register(AgentTool)
+  registry.register(MemoryTool)
   return registry
 }
 
@@ -138,8 +144,23 @@ async function main() {
     process.on('beforeExit', () => mcpManager?.disconnect())
   }
 
-  // Pre-fetch git context once per session (design from Claude Code: memoized per session)
-  const gitContext = await getGitContext(cwd)
+  // --- ToolSearch (register after MCP so it can search all deferred tools) ---
+  const deferredCount = tools.deferredTools().length
+  if (deferredCount > 0) {
+    tools.register(createToolSearchTool(tools))
+  }
+
+  // --- Memory System ---
+  const memoryManager = new MemoryManager({ projectDir: cwd })
+  setMemoryManager(memoryManager)
+  await memoryManager.ensureDir()
+
+  // Pre-fetch session context in parallel (git, memory index, CLAUDE.md)
+  const [gitContext, memoryIndex, claudeMd] = await Promise.all([
+    getGitContext(cwd),
+    memoryManager.loadMemoryIndex(),
+    loadClaudeMdFiles(cwd),
+  ])
 
   let messages: Message[] = []
 
@@ -150,12 +171,18 @@ async function main() {
   console.log(chalk.bold('  open-claude-code') + chalk.dim(' — the essence of Claude Code'))
   console.log(chalk.dim(`  provider: ${provider.name} | model: ${model}`))
   console.log(chalk.dim(`  cwd: ${cwd}`))
-  console.log(chalk.dim(`  tools: ${tools.all().map(t => t.name).join(', ')}`))
+  const activeToolNames = tools.activeTools().map(t => t.name).join(', ')
+  console.log(chalk.dim(`  tools: ${activeToolNames}`))
+  if (deferredCount > 0) {
+    console.log(chalk.dim(`  deferred: ${deferredCount} tool(s) (discoverable via ToolSearch)`))
+  }
   if (mcpToolCount > 0) {
     console.log(chalk.dim(`  mcp: ${mcpStatus.length} server(s), ${mcpToolCount} tool(s)`))
   }
   const modeLabel = permissionMode === 'bypass' ? chalk.red(permissionMode) : chalk.green(permissionMode)
   console.log(chalk.dim('  permissions: ') + modeLabel)
+  console.log(chalk.dim(`  memory: ${memoryManager.memoryPath}`))
+  if (claudeMd) console.log(chalk.dim('  CLAUDE.md: loaded'))
   console.log(chalk.dim('  type /help for commands'))
   console.log()
 
@@ -252,11 +279,27 @@ async function main() {
       rl.prompt()
       return
     }
+    if (input === '/memory') {
+      const memories = await memoryManager.scanMemories()
+      if (memories.length === 0) {
+        console.log(chalk.yellow('  No memories saved yet.'))
+        console.log(chalk.dim(`  Memory directory: ${memoryManager.memoryPath}`))
+      } else {
+        console.log(chalk.yellow(`  ${memories.length} memories:`))
+        for (const m of memories) {
+          console.log(chalk.cyan(`  [${m.type}]`) + ` ${m.name}` + chalk.dim(` — ${m.description}`))
+        }
+        console.log(chalk.dim(`  Directory: ${memoryManager.memoryPath}`))
+      }
+      rl.prompt()
+      return
+    }
     if (input === '/help') {
       console.log(chalk.dim('  /exit        quit'))
       console.log(chalk.dim('  /clear       clear conversation'))
       console.log(chalk.dim('  /model       show or switch model'))
       console.log(chalk.dim('  /cost        show token usage'))
+      console.log(chalk.dim('  /memory      list saved memories'))
       console.log(chalk.dim('  /mcp         show MCP servers and tools'))
       console.log(chalk.dim('  /permissions show or switch permission mode'))
       rl.prompt()
@@ -283,7 +326,8 @@ async function main() {
     })
 
     // Build system prompt: blocks[0]=static (cached), blocks[1]=dynamic
-    const systemPrompt = buildSystemPrompt({ cwd, gitContext })
+    const deferredToolNames = tools.deferredTools().map(t => t.name)
+    const systemPrompt = buildSystemPrompt({ cwd, gitContext, claudeMd, memoryIndex, deferredToolNames })
 
     try {
       const stream = agentLoop({
