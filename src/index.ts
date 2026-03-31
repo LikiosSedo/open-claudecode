@@ -31,6 +31,7 @@ import { MCPManager, loadMCPConfig } from './mcp.js'
 import { PermissionManager, type PermissionMode } from './permissions.js'
 import { MemoryManager, loadClaudeMdFiles } from './memory.js'
 import { MemoryTool, setMemoryManager } from './tools/memory-tool.js'
+import { SessionManager } from './session.js'
 
 // --- Provider Selection ---
 
@@ -131,6 +132,20 @@ async function main() {
     permissionMode = 'ask'
   }
 
+  // --- Session Manager ---
+  const sessionManager = new SessionManager()
+  let resumeSessionId: string | undefined
+  const resumeIdx = args.indexOf('--resume')
+  if (resumeIdx !== -1) {
+    // --resume <id> or --resume (interactive picker)
+    const nextArg = args[resumeIdx + 1]
+    if (nextArg && !nextArg.startsWith('--')) {
+      resumeSessionId = nextArg
+    } else {
+      resumeSessionId = '' // empty string = interactive picker
+    }
+  }
+
   // --- MCP Integration ---
   let mcpManager: MCPManager | null = null
   const mcpConfigs = loadMCPConfig()
@@ -164,6 +179,45 @@ async function main() {
 
   let messages: Message[] = []
 
+  // --- Session Resume or Create ---
+  let savedMessageCount = 0
+  if (resumeSessionId !== undefined) {
+    if (resumeSessionId === '') {
+      // Interactive picker: list sessions and let user choose
+      const sessions = await sessionManager.listSessions()
+      if (sessions.length === 0) {
+        console.log(chalk.yellow('  No sessions found to resume.'))
+      } else {
+        console.log(chalk.yellow('  Recent sessions:'))
+        for (let i = 0; i < sessions.length; i++) {
+          const s = sessions[i]!
+          const date = new Date(s.createdAt).toLocaleString()
+          const preview = s.lastInput ? chalk.dim(` "${s.lastInput}"`) : ''
+          console.log(chalk.cyan(`  [${i + 1}]`) + ` ${s.id}` + chalk.dim(` (${date}, ${s.messageCount} msgs)`) + preview)
+        }
+        console.log(chalk.dim('\n  Usage: --resume <session-id>'))
+        process.exit(0)
+      }
+    } else {
+      // Resume a specific session
+      try {
+        const { messages: restored, metadata } = await sessionManager.loadSession(resumeSessionId)
+        messages = restored
+        savedMessageCount = messages.length
+        sessionManager.setCurrentSession(resumeSessionId)
+        console.log(chalk.yellow(`  Resumed session ${resumeSessionId} (${messages.length} messages from ${new Date(metadata.createdAt).toLocaleString()})`))
+      } catch (err) {
+        console.error(chalk.red(`  Failed to resume session ${resumeSessionId}: ${(err as Error).message}`))
+        process.exit(1)
+      }
+    }
+  }
+
+  // Create new session if not resuming
+  if (!sessionManager.currentSessionId) {
+    await sessionManager.createSession(cwd, model)
+  }
+
   // Welcome
   const mcpStatus = mcpManager?.getStatus() ?? []
   const mcpToolCount = mcpStatus.reduce((sum, s) => sum + s.toolCount, 0)
@@ -171,6 +225,7 @@ async function main() {
   console.log(chalk.bold('  open-claude-code') + chalk.dim(' — the essence of Claude Code'))
   console.log(chalk.dim(`  provider: ${provider.name} | model: ${model}`))
   console.log(chalk.dim(`  cwd: ${cwd}`))
+  console.log(chalk.dim(`  session: ${sessionManager.currentSessionId}`))
   const activeToolNames = tools.activeTools().map(t => t.name).join(', ')
   console.log(chalk.dim(`  tools: ${activeToolNames}`))
   if (deferredCount > 0) {
@@ -226,7 +281,10 @@ async function main() {
     }
     if (input === '/clear') {
       messages = []
-      console.log(chalk.yellow('  conversation cleared.'))
+      savedMessageCount = 0
+      // Start a fresh session
+      await sessionManager.createSession(cwd, model)
+      console.log(chalk.yellow(`  conversation cleared. new session: ${sessionManager.currentSessionId}`))
       rl.prompt()
       return
     }
@@ -294,6 +352,41 @@ async function main() {
       rl.prompt()
       return
     }
+    if (input === '/session') {
+      console.log(chalk.yellow(`  session: ${sessionManager.currentSessionId}`))
+      rl.prompt()
+      return
+    }
+    if (input === '/resume' || input.startsWith('/resume ')) {
+      const arg = input.slice('/resume'.length).trim()
+      if (arg) {
+        try {
+          const { messages: restored, metadata } = await sessionManager.loadSession(arg)
+          messages = restored
+          savedMessageCount = messages.length
+          sessionManager.setCurrentSession(arg)
+          console.log(chalk.yellow(`  Resumed session ${arg} (${messages.length} messages from ${new Date(metadata.createdAt).toLocaleString()})`))
+        } catch (err) {
+          console.log(chalk.red(`  Failed to resume: ${(err as Error).message}`))
+        }
+      } else {
+        const sessions = await sessionManager.listSessions()
+        if (sessions.length === 0) {
+          console.log(chalk.yellow('  No sessions found.'))
+        } else {
+          console.log(chalk.yellow('  Recent sessions:'))
+          for (const s of sessions) {
+            const date = new Date(s.createdAt).toLocaleString()
+            const current = s.id === sessionManager.currentSessionId ? chalk.green(' (current)') : ''
+            const preview = s.lastInput ? chalk.dim(` "${s.lastInput}"`) : ''
+            console.log(chalk.cyan(`  ${s.id}`) + chalk.dim(` (${date}, ${s.messageCount} msgs)`) + current + preview)
+          }
+          console.log(chalk.dim('  Usage: /resume <session-id>'))
+        }
+      }
+      rl.prompt()
+      return
+    }
     if (input === '/help') {
       console.log(chalk.dim('  /exit        quit'))
       console.log(chalk.dim('  /clear       clear conversation'))
@@ -302,6 +395,8 @@ async function main() {
       console.log(chalk.dim('  /memory      list saved memories'))
       console.log(chalk.dim('  /mcp         show MCP servers and tools'))
       console.log(chalk.dim('  /permissions show or switch permission mode'))
+      console.log(chalk.dim('  /session     show current session ID'))
+      console.log(chalk.dim('  /resume      list/resume sessions'))
       rl.prompt()
       return
     }
@@ -380,6 +475,15 @@ async function main() {
             accumulateUsage(event.totalUsage)
             // Sync messages back (agent loop may have added assistant + tool_result messages)
             messages = event.messages
+            // Persist new messages to session file (incremental append)
+            if (sessionManager.currentSessionId) {
+              const newMessages = messages.slice(savedMessageCount)
+              if (newMessages.length > 0) {
+                sessionManager.appendMessages(sessionManager.currentSessionId, newMessages)
+                  .catch(err => console.error(chalk.red(`  Session save error: ${(err as Error).message}`)))
+                savedMessageCount = messages.length
+              }
+            }
             break
         }
       }
