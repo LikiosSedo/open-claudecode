@@ -85,9 +85,48 @@ export class ToolRegistry {
     }))
   }
 
-  private zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
-    // Lazy import to avoid circular deps
-    const { zodToJsonSchema } = require('zod-to-json-schema') as typeof import('zod-to-json-schema')
-    return zodToJsonSchema(schema, { target: 'openApi3' }) as Record<string, unknown>
+  /** Convert Zod schema to JSON Schema (synchronous, cached) */
+  zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
+    // Manual conversion for common Zod types — avoids ESM dynamic import issues
+    // For full coverage, install zod-to-json-schema and replace this method
+    return this.zodToJsonSchemaSimple(schema)
+  }
+
+  private zodToJsonSchemaSimple(schema: z.ZodType): Record<string, unknown> {
+    const def = (schema as { _def?: Record<string, unknown> })._def
+    if (!def) return { type: 'object' }
+
+    const typeName = def.typeName as string
+
+    if (typeName === 'ZodObject') {
+      const shape = (schema as z.ZodObject<z.ZodRawShape>).shape
+      const properties: Record<string, unknown> = {}
+      const required: string[] = []
+
+      for (const [key, value] of Object.entries(shape)) {
+        const fieldSchema = value as z.ZodType
+        const fieldDef = (fieldSchema as { _def?: Record<string, unknown> })._def
+        const isOptional = (fieldDef?.typeName as string) === 'ZodOptional'
+        const innerSchema = isOptional ? (fieldDef?.innerType as z.ZodType) : fieldSchema
+        properties[key] = this.zodToJsonSchemaSimple(innerSchema)
+
+        // Add description from .describe()
+        const desc = (fieldDef?.description ?? (innerSchema as { _def?: Record<string, unknown> })._def?.description) as string | undefined
+        if (desc && typeof properties[key] === 'object') {
+          (properties[key] as Record<string, unknown>).description = desc
+        }
+
+        if (!isOptional) required.push(key)
+      }
+
+      return { type: 'object', properties, ...(required.length > 0 ? { required } : {}) }
+    }
+
+    if (typeName === 'ZodString') return { type: 'string' }
+    if (typeName === 'ZodNumber') return { type: 'number' }
+    if (typeName === 'ZodBoolean') return { type: 'boolean' }
+    if (typeName === 'ZodOptional') return this.zodToJsonSchemaSimple(def.innerType as z.ZodType)
+
+    return { type: 'object' }
   }
 }

@@ -1,0 +1,493 @@
+/**
+ * Agent Loop + Streaming Tool Executor
+ * Simplified from Claude Code's query.ts + StreamingToolExecutor.ts.
+ *
+ * Key designs preserved from Claude Code:
+ * 1. Tools start executing AS the model streams (addTool on tool_use_stop)
+ * 2. Concurrency control: read-only tools parallel, mutations exclusive
+ * 3. Bash error propagation: bash failure aborts siblings; others don't
+ * 4. Async generator pattern: backpressure + cancellation via .return()
+ */
+
+import type {
+  Provider,
+  Message,
+  AssistantMessage,
+  UserMessage,
+  AssistantContent,
+  UserContent,
+  StopReason,
+  TokenUsage,
+} from './providers/types.js'
+import type {
+  Tool,
+  ToolRegistry,
+  ToolContext,
+  ToolResult,
+} from './tools/types.js'
+
+// -- AgentEvent: unified event stream yielded by agentLoop() --
+
+export type AgentEvent =
+  | { type: 'text_delta'; text: string }
+  | { type: 'thinking_delta'; thinking: string }
+  | { type: 'tool_start'; name: string; id: string }
+  | { type: 'tool_result'; name: string; id: string; result: string; isError: boolean }
+  | { type: 'turn_complete'; stopReason: StopReason; usage: TokenUsage }
+  | { type: 'message_complete'; messages: Message[]; totalUsage: TokenUsage }
+
+// -- StreamingToolExecutor: concurrent tool execution with ordering guarantees --
+
+const BASH_TOOL_NAME = 'Bash'
+
+type ToolStatus = 'queued' | 'executing' | 'completed' | 'yielded'
+
+type TrackedTool = {
+  id: string
+  name: string
+  input: Record<string, unknown>
+  tool: Tool | undefined
+  status: ToolStatus
+  isConcurrencySafe: boolean
+  promise?: Promise<void>
+  result?: { output: string; isError: boolean }
+}
+
+export class StreamingToolExecutor {
+  private tools: TrackedTool[] = []
+  private hasErrored = false
+  private erroredToolDesc = ''
+  private aborted = false
+
+  // Wake signal: resolves when a tool completes (cf. Claude Code progressAvailableResolve)
+  private wakeResolve?: () => void
+
+  constructor(
+    private readonly registry: ToolRegistry,
+    private readonly toolContext: ToolContext,
+    private readonly abortSignal?: AbortSignal,
+  ) {
+    // Listen for external abort to cancel all pending tools.
+    abortSignal?.addEventListener('abort', () => {
+      this.aborted = true
+      this.wake()
+    }, { once: true })
+  }
+
+  /** Add tool to queue. Called on tool_use_stop while model still streams. */
+  addTool(id: string, name: string, input: Record<string, unknown>): void {
+    const tool = this.registry.get(name)
+
+    // Unknown tool → immediately completed with error, same as Claude Code
+    if (!tool) {
+      this.tools.push({
+        id, name, input, tool: undefined,
+        status: 'completed',
+        isConcurrencySafe: true,
+        result: { output: `Error: No such tool: ${name}`, isError: true },
+      })
+      this.wake()
+      return
+    }
+
+    this.tools.push({
+      id, name, input, tool,
+      status: 'queued',
+      isConcurrencySafe: tool.isConcurrencySafe,
+    })
+
+    void this.processQueue()
+  }
+
+  /** Abort all pending tools. Consumer should still drain getResults(). */
+  abort(): void {
+    this.aborted = true
+    this.wake()
+  }
+
+  /** Yield results in submission order. Promise.race waits for completions.
+   *  Non-concurrent tools block yielding of later tools. (cf. getRemainingResults) */
+  async *getResults(): AsyncGenerator<{
+    name: string
+    id: string
+    result: string
+    isError: boolean
+  }> {
+    while (this.hasUnfinished()) {
+      await this.processQueue()
+
+      // Yield completed results in order
+      for (const yielded of this.yieldCompleted()) {
+        yield yielded
+      }
+
+      // If still executing, wait for any tool to complete
+      if (this.hasExecuting() && !this.hasCompleted()) {
+        const executingPromises = this.tools
+          .filter(t => t.status === 'executing' && t.promise)
+          .map(t => t.promise!)
+
+        const wakePromise = new Promise<void>(resolve => {
+          this.wakeResolve = resolve
+        })
+
+        if (executingPromises.length > 0) {
+          await Promise.race([...executingPromises, wakePromise])
+        }
+      }
+    }
+
+    // Final sweep — catch anything completed in the last iteration
+    for (const yielded of this.yieldCompleted()) {
+      yield yielded
+    }
+  }
+
+  // -- Internal scheduling --
+
+  /** Can run if: nothing executing, or both this and all running are concurrent-safe */
+  private canExecute(isConcurrencySafe: boolean): boolean {
+    const executing = this.tools.filter(t => t.status === 'executing')
+    return (
+      executing.length === 0 ||
+      (isConcurrencySafe && executing.every(t => t.isConcurrencySafe))
+    )
+  }
+
+  /** Start queued tools when concurrency allows. Non-concurrent tools block the queue. */
+  private async processQueue(): Promise<void> {
+    for (const tool of this.tools) {
+      if (tool.status !== 'queued') continue
+
+      if (this.canExecute(tool.isConcurrencySafe)) {
+        await this.executeTool(tool)
+      } else if (!tool.isConcurrencySafe) {
+        // Non-concurrent tool can't start yet; block the rest of the queue.
+        break
+      }
+    }
+  }
+
+  private async executeTool(tracked: TrackedTool): Promise<void> {
+    tracked.status = 'executing'
+
+    const run = async () => {
+      // If already aborted or a bash sibling errored, produce synthetic error
+      if (this.aborted || this.hasErrored) {
+        tracked.result = {
+          output: this.hasErrored
+            ? `Cancelled: parallel tool call ${this.erroredToolDesc} errored`
+            : 'Interrupted by user',
+          isError: true,
+        }
+        tracked.status = 'completed'
+        return
+      }
+
+      try {
+        const toolResult: ToolResult = await tracked.tool!.execute(
+          tracked.input,
+          this.toolContext,
+        )
+
+        tracked.result = {
+          output: toolResult.output,
+          isError: toolResult.isError ?? false,
+        }
+
+        // Bash errors cancel siblings; other tools are independent
+        if (toolResult.isError && tracked.name === BASH_TOOL_NAME) {
+          this.hasErrored = true
+          const desc = this.getToolDescription(tracked)
+          this.erroredToolDesc = desc
+          this.aborted = true
+        }
+      } catch (err) {
+        tracked.result = {
+          output: err instanceof Error ? err.message : String(err),
+          isError: true,
+        }
+
+        if (tracked.name === BASH_TOOL_NAME) {
+          this.hasErrored = true
+          this.erroredToolDesc = this.getToolDescription(tracked)
+          this.aborted = true
+        }
+      }
+
+      tracked.status = 'completed'
+    }
+
+    const promise = run()
+    tracked.promise = promise
+
+    void promise.finally(() => {
+      this.wake()
+      void this.processQueue()
+    })
+  }
+
+  private getToolDescription(tracked: TrackedTool): string {
+    const input = tracked.input
+    const summary = input.command ?? input.file_path ?? input.pattern ?? ''
+    if (typeof summary === 'string' && summary.length > 0) {
+      const truncated = summary.length > 40 ? summary.slice(0, 40) + '…' : summary
+      return `${tracked.name}(${truncated})`
+    }
+    return tracked.name
+  }
+
+  /** Yield completed results in order; non-concurrent executing tools block later ones. */
+  private *yieldCompleted(): Generator<{
+    name: string; id: string; result: string; isError: boolean
+  }> {
+    for (const tool of this.tools) {
+      if (tool.status === 'yielded') continue
+
+      if (tool.status === 'completed' && tool.result) {
+        tool.status = 'yielded'
+        yield {
+          name: tool.name,
+          id: tool.id,
+          result: tool.result.output,
+          isError: tool.result.isError,
+        }
+      } else if (tool.status === 'executing' && !tool.isConcurrencySafe) {
+        // Non-concurrent tool still running — block yielding of later tools
+        break
+      }
+    }
+  }
+
+  private hasUnfinished(): boolean {
+    return this.tools.some(t => t.status !== 'yielded')
+  }
+
+  private hasExecuting(): boolean {
+    return this.tools.some(t => t.status === 'executing')
+  }
+
+  private hasCompleted(): boolean {
+    return this.tools.some(t => t.status === 'completed')
+  }
+
+  private wake(): void {
+    if (this.wakeResolve) {
+      this.wakeResolve()
+      this.wakeResolve = undefined
+    }
+  }
+}
+
+// -- agentLoop: core agent loop (simplified from Claude Code's query.ts) --
+
+function addUsage(a: TokenUsage, b?: TokenUsage): TokenUsage {
+  if (!b) return { ...a }
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0),
+    cacheWriteTokens: (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0),
+  }
+}
+
+const EMPTY_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+
+export interface AgentLoopOptions {
+  provider: Provider
+  tools: ToolRegistry
+  systemPrompt: string | string[]
+  messages: Message[]
+  model: string
+  maxTurns?: number
+  maxTokens?: number
+  temperature?: number
+  abortSignal?: AbortSignal
+  /** Tool execution context (cwd, etc.) */
+  toolContext?: ToolContext
+  /** Context compaction callback. Implementation is external (cf. Claude Code autocompact). */
+  onCompact?: (messages: Message[]) => Promise<Message[]>
+}
+
+/**
+ * Core agent loop. Async generator yielding AgentEvents.
+ * Loop: stream response → execute tools → build messages → repeat if tool_use.
+ */
+export async function* agentLoop(
+  options: AgentLoopOptions,
+): AsyncGenerator<AgentEvent> {
+  const {
+    provider,
+    tools,
+    model,
+    maxTurns = 30,
+    maxTokens,
+    temperature,
+    abortSignal,
+  } = options
+
+  const systemPrompt = options.systemPrompt
+  const toolSchemas = tools.toSchemas()
+  const toolContext: ToolContext = options.toolContext ?? { cwd: process.cwd() }
+
+  // Copy so the caller's array isn't mutated
+  const messages: Message[] = [...options.messages]
+  let totalUsage: TokenUsage = { ...EMPTY_USAGE }
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const stream = provider.stream(messages, toolSchemas, { model, maxTokens, systemPrompt, temperature })
+
+    const contentBlocks: AssistantContent[] = []
+    let currentText = '', currentThinking = ''
+    let stopReason: StopReason = 'end_turn'
+    let turnUsage: TokenUsage = { ...EMPTY_USAGE }
+    const pendingToolBlocks = new Map<string, { name: string; partialJson: string }>()
+    let hasToolUse = false
+    // New executor per turn (Claude Code: query.ts:562)
+    const executor = new StreamingToolExecutor(tools, toolContext, abortSignal)
+
+    for await (const event of stream) {
+      if (abortSignal?.aborted) break
+
+      switch (event.type) {
+        case 'text_delta': {
+          currentText += event.text
+          yield { type: 'text_delta', text: event.text }
+          break
+        }
+
+        case 'thinking_delta': {
+          currentThinking += event.thinking
+          yield { type: 'thinking_delta', thinking: event.thinking }
+          break
+        }
+
+        case 'tool_use_start': {
+          // Flush accumulated text/thinking before the tool_use block
+          if (currentText) {
+            contentBlocks.push({ type: 'text', text: currentText })
+            currentText = ''
+          }
+          if (currentThinking) {
+            contentBlocks.push({ type: 'thinking', thinking: currentThinking })
+            currentThinking = ''
+          }
+          pendingToolBlocks.set(event.id, { name: event.name, partialJson: '' })
+          hasToolUse = true
+          break
+        }
+
+        case 'tool_use_delta': {
+          const pending = pendingToolBlocks.get(event.id)
+          if (pending) {
+            pending.partialJson += event.partialJson
+          }
+          break
+        }
+
+        case 'tool_use_stop': {
+          // Critical optimization: feed to executor while model still streams
+          const input = event.input as Record<string, unknown>
+          const toolName = pendingToolBlocks.get(event.id)?.name ?? 'unknown'
+          pendingToolBlocks.delete(event.id)
+
+          contentBlocks.push({ type: 'tool_use', id: event.id, name: toolName, input })
+          executor.addTool(event.id, toolName, input)
+
+          yield { type: 'tool_start', name: toolName, id: event.id }
+          break
+        }
+
+        case 'message_stop': {
+          stopReason = event.stopReason
+          if (event.usage) {
+            turnUsage = addUsage(turnUsage, event.usage)
+          }
+          break
+        }
+
+        case 'message_start': {
+          if (event.usage) {
+            turnUsage = addUsage(turnUsage, event.usage)
+          }
+          break
+        }
+      }
+    }
+
+    // Flush trailing text/thinking
+    if (currentText) {
+      contentBlocks.push({ type: 'text', text: currentText })
+    }
+    if (currentThinking) {
+      contentBlocks.push({ type: 'thinking', thinking: currentThinking })
+    }
+
+    // -- 2. Build assistant message --
+    const assistantMessage: AssistantMessage = {
+      role: 'assistant',
+      content: contentBlocks,
+    }
+    messages.push(assistantMessage)
+
+    // -- 3. Collect tool results --
+    if (hasToolUse) {
+      if (abortSignal?.aborted) {
+        executor.abort()
+      }
+
+      const toolResultContents: UserContent[] = []
+      // Drain all results (cf. Claude Code getRemainingResults, query.ts:1380)
+      for await (const result of executor.getResults()) {
+        yield {
+          type: 'tool_result',
+          name: result.name,
+          id: result.id,
+          result: result.result,
+          isError: result.isError,
+        }
+
+        toolResultContents.push({
+          type: 'tool_result',
+          toolUseId: result.id,
+          content: result.result,
+          isError: result.isError || undefined,
+        })
+      }
+
+      // API requires tool_result in a user message after the tool_use assistant message
+      if (toolResultContents.length > 0) {
+        const userMessage: UserMessage = {
+          role: 'user',
+          content: toolResultContents,
+        }
+        messages.push(userMessage)
+      }
+    }
+
+    totalUsage = addUsage(totalUsage, turnUsage)
+
+    // -- 4. Check if we should continue --
+    if (abortSignal?.aborted) {
+      break
+    }
+
+    if (stopReason !== 'tool_use' || !hasToolUse) {
+      yield { type: 'turn_complete', stopReason, usage: turnUsage }
+      break
+    }
+
+    yield { type: 'turn_complete', stopReason, usage: turnUsage }
+
+    // -- 5. Context compaction hook (cf. Claude Code autocompact) --
+    if (options.onCompact) {
+      const compacted = await options.onCompact(messages)
+      if (compacted !== messages) {
+        messages.length = 0
+        messages.push(...compacted)
+      }
+    }
+  }
+
+  yield { type: 'message_complete', messages, totalUsage }
+}
