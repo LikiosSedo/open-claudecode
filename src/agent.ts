@@ -326,6 +326,52 @@ export class StreamingToolExecutor {
   }
 }
 
+// -- Tool Result Collapsing (cf. Claude Code classifyForCollapse.ts) --
+
+const COLLAPSE_THRESHOLD = 4000  // chars, ~1000 tokens
+const PRESERVE_RECENT_TURNS = 2  // keep the most recent 2 tool turns intact
+
+/**
+ * Collapse large tool results from older turns to save context.
+ * Mutates messages in-place. Only collapses tool_result blocks in user messages.
+ * Preserves the most recent PRESERVE_RECENT_TURNS tool turns untouched.
+ */
+function collapseOldToolResults(messages: Message[]): void {
+  // Find the index before which we collapse: walk backwards counting tool turns
+  let turnsFromEnd = 0
+  let preserveFromIndex = messages.length
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!
+    if (msg.role === 'user' && msg.content.some(c => c.type === 'tool_result')) {
+      turnsFromEnd++
+      if (turnsFromEnd >= PRESERVE_RECENT_TURNS) {
+        preserveFromIndex = i
+        break
+      }
+    }
+  }
+
+  // Collapse large tool_result blocks before preserveFromIndex
+  for (let i = 0; i < preserveFromIndex; i++) {
+    const msg = messages[i]!
+    if (msg.role !== 'user') continue
+
+    msg.content = msg.content.map(block => {
+      if (block.type !== 'tool_result') return block
+      if (block.content.length <= COLLAPSE_THRESHOLD) return block
+
+      const preview = block.content.slice(0, 200)
+      const lines = block.content.split('\n').length
+      const chars = block.content.length
+      return {
+        ...block,
+        content: `[Collapsed: ${lines} lines, ${chars} chars. Preview: ${preview}...]`,
+      }
+    })
+  }
+}
+
 // -- agentLoop: core agent loop (simplified from Claude Code's query.ts) --
 
 function addUsage(a: TokenUsage, b?: TokenUsage): TokenUsage {
@@ -360,6 +406,11 @@ export interface AgentLoopOptions {
    * The callback handles ask/deny logic internally (may prompt user).
    */
   permissionCheck?: (toolName: string, input: Record<string, unknown>) => Promise<PermissionDecision>
+  /** Extended thinking configuration */
+  thinking?:
+    | { type: 'disabled' }
+    | { type: 'adaptive' }
+    | { type: 'enabled'; budgetTokens: number }
 }
 
 /**
@@ -378,6 +429,7 @@ export async function* agentLoop(
     temperature,
     abortSignal,
     permissionCheck,
+    thinking,
   } = options
 
   const systemPrompt = options.systemPrompt
@@ -402,6 +454,11 @@ export async function* agentLoop(
   let reactiveCompactAttempts = 0
   const MAX_REACTIVE_COMPACT_ATTEMPTS = 2
 
+  // Continuation diminishing returns tracking (cf. Claude Code tokenBudget.ts)
+  let continuationCount = 0
+  const MAX_CONTINUATIONS = 5
+  const MIN_CONTINUATION_TOKENS = 200
+
   for (let turn = 0; turn < maxTurns; turn++) {
     // Normalize messages before every API call: fix tool pairing + enforce alternation
     const normalizedMessages = normalizeMessages(ensureToolResultPairing(messages))
@@ -411,7 +468,7 @@ export async function* agentLoop(
 
     let stream: AsyncIterable<import('./providers/types.js').StreamEvent>
     try {
-      stream = provider.stream(normalizedMessages, toolSchemas, { model, maxTokens, systemPrompt, temperature })
+      stream = provider.stream(normalizedMessages, toolSchemas, { model, maxTokens, systemPrompt, temperature, thinking })
     } catch (err) {
       // Synchronous errors from provider.stream() (e.g. pre-flight validation)
       if (
@@ -624,10 +681,23 @@ export async function* agentLoop(
     }
 
     if (stopReason === 'tool_use' && hasToolUse) {
-      // Tool loop continues — fall through to compaction + next turn
+      // Tool loop continues — reset continuation counter, collapse old results
+      continuationCount = 0
+      collapseOldToolResults(messages)
     } else if (stopReason === 'max_tokens' && turn < maxTurns - 1) {
-      // Auto-continue: output was truncated by max_tokens.
-      // Inject a continuation prompt so the model resumes where it left off.
+      // Auto-continue with diminishing returns detection
+      continuationCount++
+
+      const outputTokens = turnUsage.outputTokens
+      if (continuationCount > 1 && outputTokens > 0 && outputTokens < MIN_CONTINUATION_TOKENS) {
+        yield { type: 'text_delta', text: '\n...stopped (diminishing output)\n' }
+        break
+      }
+      if (continuationCount >= MAX_CONTINUATIONS) {
+        yield { type: 'text_delta', text: '\n...stopped (max continuations reached)\n' }
+        break
+      }
+
       yield { type: 'text_delta', text: '\n...continuing...\n' }
       messages.push({
         role: 'user',

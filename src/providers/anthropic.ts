@@ -70,14 +70,28 @@ export class AnthropicProvider implements Provider {
       let response
       try {
         // Use raw stream to avoid SDK's O(n²) partialParse overhead
-        response = await this.client.messages.create({
+        const params: Record<string, unknown> = {
           model: options.model,
           max_tokens: options.maxTokens ?? 16384,
           system: systemBlocks,
           messages: anthropicMessages as Anthropic.MessageParam[],
           tools: anthropicTools.length > 0 ? anthropicTools : undefined,
           stream: true,
-        })
+        }
+
+        // Add thinking configuration
+        if (options.thinking) {
+          if (options.thinking.type === 'enabled') {
+            params.thinking = { type: 'enabled', budget_tokens: options.thinking.budgetTokens }
+            params.max_tokens = Math.max(params.max_tokens as number, options.thinking.budgetTokens + 8192)
+          } else if (options.thinking.type === 'adaptive') {
+            params.thinking = { type: 'enabled', budget_tokens: 10000 }
+            params.max_tokens = Math.max(params.max_tokens as number, 10000 + 8192)
+          }
+          // disabled = don't send thinking param
+        }
+
+        response = await this.client.messages.create(params as unknown as Anthropic.MessageCreateParamsStreaming)
       } catch (err) {
         lastError = err
         if (!isRetryableError(err) || attempt >= MAX_RETRIES) throw err

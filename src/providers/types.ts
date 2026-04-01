@@ -65,6 +65,11 @@ export interface ProviderOptions {
   maxTokens?: number
   systemPrompt?: string | string[]
   temperature?: number
+  /** Extended thinking configuration */
+  thinking?:
+    | { type: 'disabled' }
+    | { type: 'adaptive' }
+    | { type: 'enabled'; budgetTokens: number }
 }
 
 export interface Provider {

@@ -199,6 +199,28 @@ function calculateCostUSD(model: string, usage: typeof totalUsage): number {
   )
 }
 
+// --- Thinking Config ---
+
+type ThinkingConfig =
+  | { type: 'disabled' }
+  | { type: 'adaptive' }
+  | { type: 'enabled'; budgetTokens: number }
+
+function parseThinkingConfig(value: string | undefined): ThinkingConfig {
+  if (!value || value === 'adaptive') return { type: 'adaptive' }
+  if (value === 'disabled') return { type: 'disabled' }
+  // "enabled:N" format
+  const match = value.match(/^enabled:(\d+)$/)
+  if (match) return { type: 'enabled', budgetTokens: parseInt(match[1]!, 10) }
+  return { type: 'adaptive' }
+}
+
+function formatThinkingConfig(config: ThinkingConfig): string {
+  if (config.type === 'disabled') return 'disabled'
+  if (config.type === 'adaptive') return 'adaptive'
+  return `enabled:${config.budgetTokens}`
+}
+
 // --- Main ---
 
 // --- Permission Prompt ---
@@ -240,6 +262,7 @@ function createPermissionPrompter(rl: readline.Interface) {
 async function main() {
   const { provider, defaultModel } = createProvider()
   let model = process.env.OCC_MODEL ?? defaultModel
+  let thinkingConfig: ThinkingConfig = parseThinkingConfig(process.env.OCC_THINKING)
   const cwd = process.cwd()
   const tools = createToolRegistry()
   const contextManager = new ContextManager()
@@ -394,6 +417,7 @@ async function main() {
   const modeLabel = permissionMode === 'bypass' ? chalk.red(permissionMode) : chalk.green(permissionMode)
   console.log(chalk.dim('  permissions: ') + modeLabel)
   console.log(chalk.dim(`  memory: ${memoryManager.memoryPath}`))
+  console.log(chalk.dim(`  thinking: ${formatThinkingConfig(thinkingConfig)}`))
   if (claudeMd) console.log(chalk.dim('  CLAUDE.md: loaded'))
   console.log(chalk.dim('  type /help for commands'))
   console.log()
@@ -491,6 +515,18 @@ async function main() {
         console.log(chalk.yellow(`  model → ${model}`))
       } else {
         console.log(chalk.yellow(`  current model: ${model}`))
+      }
+      prompt()
+      return
+    }
+    if (input.startsWith('/thinking')) {
+      const arg = input.slice('/thinking'.length).trim()
+      if (arg) {
+        thinkingConfig = parseThinkingConfig(arg)
+        console.log(chalk.yellow(`  thinking → ${formatThinkingConfig(thinkingConfig)}`))
+      } else {
+        console.log(chalk.yellow(`  thinking: ${formatThinkingConfig(thinkingConfig)}`))
+        console.log(chalk.dim('  modes: disabled, adaptive, enabled:N (N = budget tokens)'))
       }
       prompt()
       return
@@ -633,6 +669,7 @@ async function main() {
       console.log(chalk.dim('  /permissions show or switch permission mode'))
       console.log(chalk.dim('  /resume      list/resume sessions'))
       console.log(chalk.dim('  /session     show current session ID'))
+      console.log(chalk.dim('  /thinking    show or switch thinking mode'))
       prompt()
       return
     }
@@ -678,6 +715,7 @@ async function main() {
         messages,
         tools,
         systemPrompt,
+        thinking: thinkingConfig,
         abortSignal: abortController.signal,
         toolContext: { cwd },
         permissionCheck: (toolName, toolInput) => permissionManager.check(toolName, toolInput),
