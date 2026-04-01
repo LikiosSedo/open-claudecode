@@ -31,6 +31,7 @@ import {
   ensureToolResultPairing,
   isPromptTooLong,
 } from './messages.js'
+import type { HookManager } from './hooks.js'
 
 // -- AgentEvent: unified event stream yielded by agentLoop() --
 
@@ -398,14 +399,17 @@ export interface AgentLoopOptions {
   abortSignal?: AbortSignal
   /** Tool execution context (cwd, etc.) */
   toolContext?: ToolContext
-  /** Context compaction callback. Implementation is external (cf. Claude Code autocompact). */
-  onCompact?: (messages: Message[]) => Promise<Message[]>
+  /** Context compaction callback. Implementation is external (cf. Claude Code autocompact).
+   *  When force is true, compaction must bypass threshold/circuit-breaker (reactive compact). */
+  onCompact?: (messages: Message[], options?: { force?: boolean }) => Promise<Message[]>
   /**
    * Permission check callback. Called before each tool execution.
    * If absent, all tools are allowed (backward-compatible).
    * The callback handles ask/deny logic internally (may prompt user).
    */
   permissionCheck?: (toolName: string, input: Record<string, unknown>) => Promise<PermissionDecision>
+  /** Hook manager for lifecycle hooks (PreToolUse, PostToolUse, etc.) */
+  hookManager?: HookManager
   /** Extended thinking configuration */
   thinking?:
     | { type: 'disabled' }
@@ -429,6 +433,7 @@ export async function* agentLoop(
     temperature,
     abortSignal,
     permissionCheck,
+    hookManager,
     thinking,
   } = options
 
@@ -477,7 +482,7 @@ export async function* agentLoop(
         reactiveCompactAttempts < MAX_REACTIVE_COMPACT_ATTEMPTS
       ) {
         reactiveCompactAttempts++
-        const compacted = await options.onCompact(messages)
+        const compacted = await options.onCompact(messages, { force: true })
         messages.length = 0
         messages.push(...compacted)
         continue // retry the turn with compacted messages
@@ -554,9 +559,25 @@ export async function* agentLoop(
         }
 
         case 'tool_use_stop': {
-          const input = event.input as Record<string, unknown>
+          let input = event.input as Record<string, unknown>
           const toolName = pendingToolBlocks.get(event.id)?.name ?? 'unknown'
           pendingToolBlocks.delete(event.id)
+
+          // PreToolUse hooks: may deny or modify input before permission check
+          if (hookManager) {
+            const hookResult = await hookManager.execute('PreToolUse', {
+              toolName, toolInput: input,
+            })
+            if (hookResult.decision === 'deny') {
+              contentBlocks.push({ type: 'tool_use', id: event.id, name: toolName, input })
+              executor.addDeniedTool(event.id, toolName, hookResult.reason ?? 'Denied by hook')
+              yield { type: 'tool_start', name: toolName, id: event.id }
+              break
+            }
+            if (hookResult.updatedInput) {
+              input = hookResult.updatedInput
+            }
+          }
 
           contentBlocks.push({ type: 'tool_use', id: event.id, name: toolName, input })
 
@@ -602,7 +623,7 @@ export async function* agentLoop(
         reactiveCompactAttempts < MAX_REACTIVE_COMPACT_ATTEMPTS
       ) {
         reactiveCompactAttempts++
-        const compacted = await options.onCompact(messages)
+        const compacted = await options.onCompact(messages, { force: true })
         messages.length = 0
         messages.push(...compacted)
         streamErrored = true
@@ -651,6 +672,15 @@ export async function* agentLoop(
           id: event.id,
           result: event.result,
           isError: event.isError,
+        }
+
+        // PostToolUse hooks: fire-and-forget observation after each tool result
+        if (hookManager) {
+          await hookManager.execute('PostToolUse', {
+            toolName: event.name,
+            toolResult: event.result,
+            isError: event.isError,
+          })
         }
 
         toolResultContents.push({

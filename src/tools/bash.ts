@@ -27,6 +27,13 @@ Prefer dedicated tools (Read, Write, Edit, Glob, Grep) over bash for file operat
   isConcurrencySafe: false,
   isReadOnly: false,
 
+  toolPrompt: () => `# Bash Tool Usage
+- Quote file paths with spaces in double quotes
+- Use absolute paths when possible
+- For git: never use -i (interactive) flags, never skip hooks (--no-verify)
+- Prefer specific file staging over "git add -A"
+- Background: use run_in_background for long commands`,
+
   async execute(input: Input, context: ToolContext): Promise<ToolResult> {
     const timeout = input.timeout ?? 120_000
 

@@ -12,7 +12,7 @@
  */
 
 import type { PermissionDecision } from './tools/types.js'
-import { analyzeCommand } from './bash-security.js'
+import { validateBashCommand } from './bash-security.js'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
@@ -120,11 +120,23 @@ const COMPOUND_OPERATORS = /[|&;]|&&|\|\|/
 /**
  * Analyze a bash command and decide if it needs permission.
  * Returns allow if safe, ask with reason if not.
+ *
+ * Security analysis runs FIRST (before command categorization) to catch
+ * injection vectors like control characters, command substitution, IFS
+ * manipulation, etc. regardless of whether the base command is "safe".
  */
 function analyzeBashCommand(command: string): PermissionDecision {
   const trimmed = command.trim()
 
-  // Check dangerous patterns first (highest priority)
+  // SECURITY: Run deep security analysis BEFORE command categorization.
+  // These checks catch injection vectors that bypass allowlist/denylist:
+  // control chars, unicode whitespace, $(), ``, IFS, brace expansion, etc.
+  const securityResult = validateBashCommand(trimmed)
+  if (!securityResult.safe) {
+    return { behavior: 'ask', message: securityResult.reason! }
+  }
+
+  // Check dangerous patterns (highest priority after security analysis)
   for (const { pattern, reason } of DANGEROUS_PATTERNS) {
     if (pattern.test(trimmed)) {
       return { behavior: 'ask', message: `Dangerous pattern detected: ${reason}` }
@@ -133,7 +145,6 @@ function analyzeBashCommand(command: string): PermissionDecision {
 
   // Check for compound commands — can't verify safety of each part
   if (COMPOUND_OPERATORS.test(trimmed)) {
-    // Extract all base commands from the compound expression
     const parts = trimmed.split(/[|&;]+/).map(s => s.trim()).filter(Boolean)
     for (const part of parts) {
       const baseCmd = extractBaseCommand(part)
@@ -141,13 +152,12 @@ function analyzeBashCommand(command: string): PermissionDecision {
         return { behavior: 'ask', message: `Compound command contains dangerous command: ${baseCmd}` }
       }
     }
-    // If all parts are safe commands, run deep security analysis before allowing
     const allSafe = parts.every(part => {
       const baseCmd = extractBaseCommand(part)
       return baseCmd !== null && SAFE_COMMANDS.has(baseCmd)
     })
     if (allSafe) {
-      return deepSecurityAnalysis(trimmed)
+      return { behavior: 'allow' }
     }
     return { behavior: 'ask', message: 'Compound command — cannot verify safety of all parts' }
   }
@@ -163,24 +173,11 @@ function analyzeBashCommand(command: string): PermissionDecision {
   }
 
   if (SAFE_COMMANDS.has(baseCmd)) {
-    return deepSecurityAnalysis(trimmed)
+    return { behavior: 'allow' }
   }
 
   // Unknown command — ask to be safe
   return { behavior: 'ask', message: `Unknown command: ${baseCmd}` }
-}
-
-/**
- * Deep security analysis — runs after the fast allowlist/denylist checks.
- * Catches injection vectors that simple command-name checks miss
- * (command substitution, process substitution, IFS injection, etc.).
- */
-function deepSecurityAnalysis(command: string): PermissionDecision {
-  const result = analyzeCommand(command)
-  if (!result.safe) {
-    return { behavior: 'ask', message: result.reason! }
-  }
-  return { behavior: 'allow' }
 }
 
 /**

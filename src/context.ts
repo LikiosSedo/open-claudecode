@@ -101,6 +101,18 @@ export class ContextManager {
   }
 
   /**
+   * Force compact — bypass needsCompaction() threshold and circuit breaker.
+   * Used by reactive compact (413 recovery) where the API already rejected.
+   */
+  async forceCompact(
+    messages: Message[],
+    provider?: Provider,
+    model?: string,
+  ): Promise<{ messages: Message[]; compacted: boolean; summary?: string }> {
+    return this.compactInternal(messages, provider, model)
+  }
+
+  /**
    * Compact conversation. Strategy ladder (cheapest first):
    * 1. Truncation — drop old messages, keep recent N
    * 2. LLM summary — summarize dropped messages via provider
@@ -114,6 +126,14 @@ export class ContextManager {
     if (!this.needsCompaction(messages)) {
       return { messages, compacted: false }
     }
+    return this.compactInternal(messages, provider, model)
+  }
+
+  private async compactInternal(
+    messages: Message[],
+    provider?: Provider,
+    model?: string,
+  ): Promise<{ messages: Message[]; compacted: boolean; summary?: string }> {
 
     // Strategy 1: Truncation — keep recent messages based on token budget
     const recentTokenBudget = this.budget * RECENT_TOKEN_RATIO

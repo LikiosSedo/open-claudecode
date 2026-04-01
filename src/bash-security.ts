@@ -2,7 +2,7 @@
  * Bash Security Analysis
  *
  * Simplified from Claude Code's bashSecurity.ts (2592 lines, 30+ validators).
- * Covers the top-10 highest-risk attack vectors with ~500 lines.
+ * Covers the top-15 highest-risk attack vectors.
  *
  * Design:
  * - Each check is an independent, pure function
@@ -24,7 +24,7 @@ export interface SecurityCheckResult {
  * Run all security checks on a bash command.
  * Returns the first failing check, or { safe: true } if all pass.
  */
-export function analyzeCommand(command: string): SecurityCheckResult {
+export function validateBashCommand(command: string): SecurityCheckResult {
   for (const check of CHECKS) {
     const result = check(command)
     if (!result.safe) return result
@@ -43,6 +43,7 @@ const CHECKS: SecurityCheck[] = [
   checkUnicodeWhitespace,
   checkCommandSubstitution,
   checkProcessSubstitution,
+  checkHeredocInSubstitution,
   checkIFSInjection,
   checkProcAccess,
   checkBraceExpansion,
@@ -50,6 +51,9 @@ const CHECKS: SecurityCheck[] = [
   checkDangerousRedirection,
   checkBackslashEscapedOperators,
   checkNewlineInjection,
+  checkObfuscatedFlags,
+  checkBackslashEscapedWhitespace,
+  checkCommentQuoteDesync,
 ]
 
 // -- Helpers --
@@ -324,7 +328,56 @@ function checkProcessSubstitution(command: string): SecurityCheckResult {
 }
 
 /**
- * Check 5: IFS Injection
+ * Check 5: Heredoc in Substitution
+ *
+ * Detects heredoc syntax inside command substitution: $(<<EOF ... EOF)
+ * or $(cat <<EOF ... EOF). This pattern can inject arbitrary commands
+ * disguised as data in a heredoc body.
+ *
+ * We flag ANY $(...<< pattern. The safe variant ($(cat <<'EOF'...) with
+ * a quoted/escaped delimiter) is extremely niche — better to prompt than miss.
+ *
+ * Ref: Claude Code HEREDOC_IN_SUBSTITUTION
+ */
+function checkHeredocInSubstitution(command: string): SecurityCheckResult {
+  // Check outside single quotes (heredoc in $() still expands inside double quotes)
+  let inSingleQuote = false
+  let escaped = false
+
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i]!
+    if (escaped) { escaped = false; continue }
+    if (char === '\\' && !inSingleQuote) { escaped = true; continue }
+    if (char === "'") {
+      if (!inSingleQuote) {
+        const close = command.indexOf("'", i + 1)
+        if (close === -1) break
+        i = close
+        continue
+      }
+      inSingleQuote = false
+      continue
+    }
+
+    // Look for $( ... <<
+    if (char === '$' && command[i + 1] === '(') {
+      // Scan inside the substitution for <<
+      const rest = command.slice(i + 2)
+      if (/<</.test(rest)) {
+        return {
+          safe: false,
+          reason: 'Command contains heredoc inside command substitution $(<<...) which can hide arbitrary commands',
+          checkId: 'heredoc_in_substitution',
+        }
+      }
+    }
+  }
+
+  return { safe: true }
+}
+
+/**
+ * Check 6: IFS Injection (renumbered)
  *
  * Detects usage of the IFS variable ($IFS, ${IFS}, ${...IFS...}, IFS=).
  * IFS controls word splitting in bash — modifying it can make a single
@@ -661,6 +714,192 @@ function checkNewlineInjection(command: string): SecurityCheckResult {
       safe: false,
       reason: 'Command contains newlines that could separate multiple commands',
       checkId: 'newline_injection',
+    }
+  }
+
+  return { safe: true }
+}
+
+/**
+ * Check 13: Obfuscated Flags
+ *
+ * Detects shell quoting tricks used to hide flags from regex-based checks:
+ * - ANSI-C quoting: $'...' can encode any character via escape sequences
+ *   e.g., find . $'-exec' rm {} \; — hides -exec from flag blocklists
+ * - Locale quoting: $"..." — same risk
+ * - Empty quotes before dash: ''-exec, ""-f — bash concatenates to -exec, -f
+ * - Quoted flag content: "-exec", '-f' — hides the flag name inside quotes
+ *
+ * Ref: Claude Code OBFUSCATED_FLAGS (check 4)
+ */
+function checkObfuscatedFlags(command: string): SecurityCheckResult {
+  // 1. Block ANSI-C quoting ($'...'): can encode any character
+  if (/\$'[^']*'/.test(command)) {
+    return {
+      safe: false,
+      reason: 'Command contains ANSI-C quoting ($\'...\') which can hide characters in flag names',
+      checkId: 'obfuscated_flags',
+    }
+  }
+
+  // 2. Block locale quoting ($"...")
+  if (/\$"[^"]*"/.test(command)) {
+    return {
+      safe: false,
+      reason: 'Command contains locale quoting ($"...") which can hide characters',
+      checkId: 'obfuscated_flags',
+    }
+  }
+
+  // 3. Block empty quotes followed by dash: ''-exec, ""-f, $''-exec, $""-f
+  if (/(?:^|\s)(?:''|"")+\s*-/.test(command)) {
+    return {
+      safe: false,
+      reason: 'Command contains empty quotes before dash (potential flag bypass)',
+      checkId: 'obfuscated_flags',
+    }
+  }
+
+  // 4. Block empty quote pair adjacent to quoted dash: """-f", '''-f'
+  if (/(?:""|'')+['"]-/.test(command)) {
+    return {
+      safe: false,
+      reason: 'Command contains empty quote pair adjacent to quoted dash (potential flag obfuscation)',
+      checkId: 'obfuscated_flags',
+    }
+  }
+
+  // 5. Block 3+ consecutive quotes at word start (multi-quote obfuscation)
+  if (/(?:^|\s)['"]{3,}/.test(command)) {
+    return {
+      safe: false,
+      reason: 'Command contains consecutive quote characters at word start (potential obfuscation)',
+      checkId: 'obfuscated_flags',
+    }
+  }
+
+  // 6. Detect quoted flag content: whitespace + quote + dash-letter pattern
+  // Track quote state to avoid false positives inside legitimately quoted strings
+  const unquoted = removeQuotedContent(command)
+  // Check for quote chars remaining adjacent to dashes in unquoted content
+  // (indicates a flag name was partially inside quotes)
+  if (/\s['"`]-/.test(unquoted)) {
+    return {
+      safe: false,
+      reason: 'Command contains quoted characters in flag names',
+      checkId: 'obfuscated_flags',
+    }
+  }
+
+  return { safe: true }
+}
+
+/**
+ * Check 14: Backslash-Escaped Whitespace
+ *
+ * Detects backslash-escaped space or tab outside of quotes.
+ * In bash, `echo\ test` is a SINGLE token (command named "echo test"),
+ * but naive parsers see two tokens ["echo", "test"].
+ *
+ * This discrepancy enables path traversal attacks:
+ *   echo\ test/../../../usr/bin/touch /tmp/file
+ * Parser sees: echo with args (safe). Bash runs: /usr/bin/touch /tmp/file.
+ *
+ * Ref: Claude Code BACKSLASH_ESCAPED_WHITESPACE (check 15)
+ */
+function checkBackslashEscapedWhitespace(command: string): SecurityCheckResult {
+  let inSingleQuote = false
+  let inDoubleQuote = false
+
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i]!
+
+    if (char === '\\' && !inSingleQuote) {
+      if (!inDoubleQuote) {
+        const nextChar = command[i + 1]
+        if (nextChar === ' ' || nextChar === '\t') {
+          return {
+            safe: false,
+            reason: 'Command contains backslash-escaped whitespace that could alter command parsing',
+            checkId: 'backslash_escaped_whitespace',
+          }
+        }
+      }
+      // Skip escaped char (both outside and inside double quotes)
+      i++
+      continue
+    }
+
+    if (char === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote
+      continue
+    }
+    if (char === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote
+      continue
+    }
+  }
+
+  return { safe: true }
+}
+
+/**
+ * Check 15: Comment-Quote Desync
+ *
+ * Detects quote characters (' or ") inside an unquoted # comment.
+ * In bash, everything after # is a comment — quote chars are literal.
+ * But regex-based quote trackers (like removeQuotedContent) don't know
+ * about comments, so a ' after # toggles their quote state, desyncing
+ * them from bash. Attackers exploit this to hide dangerous content.
+ *
+ * Example:
+ *   echo "it's" # ' "  ← the ' after # desyncs quote tracking
+ *   rm -rf /           ← this line appears "quoted" to our checks
+ *
+ * Ref: Claude Code COMMENT_QUOTE_DESYNC (check 22)
+ */
+function checkCommentQuoteDesync(command: string): SecurityCheckResult {
+  let inSingleQuote = false
+  let inDoubleQuote = false
+  let escaped = false
+
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i]!
+
+    if (escaped) { escaped = false; continue }
+
+    if (inSingleQuote) {
+      if (char === "'") inSingleQuote = false
+      continue
+    }
+
+    if (char === '\\') {
+      escaped = true
+      continue
+    }
+
+    if (inDoubleQuote) {
+      if (char === '"') inDoubleQuote = false
+      continue
+    }
+
+    if (char === "'") { inSingleQuote = true; continue }
+    if (char === '"') { inDoubleQuote = true; continue }
+
+    // Unquoted # — starts a comment. Check rest of line for quote chars.
+    if (char === '#') {
+      const lineEnd = command.indexOf('\n', i)
+      const commentText = command.slice(i + 1, lineEnd === -1 ? command.length : lineEnd)
+      if (/['"]/.test(commentText)) {
+        return {
+          safe: false,
+          reason: 'Command contains quote characters inside a # comment which can desync quote tracking',
+          checkId: 'comment_quote_desync',
+        }
+      }
+      // Skip to end of line
+      if (lineEnd === -1) break
+      i = lineEnd
     }
   }
 

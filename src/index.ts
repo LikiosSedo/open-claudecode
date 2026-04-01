@@ -37,6 +37,7 @@ import { MemoryTool, setMemoryManager } from './tools/memory-tool.js'
 import { SessionManager } from './session.js'
 import { renderMarkdown, renderInline } from './render.js'
 import { runDiagnostics, formatDiagnostics } from './doctor.js'
+import { HookManager } from './hooks.js'
 
 // --- Input History Persistence ---
 
@@ -321,6 +322,9 @@ async function main() {
     loadClaudeMdFiles(cwd),
   ])
 
+  // --- Hooks System ---
+  const hookManager = new HookManager()
+
   // --- Non-interactive --print mode ---
   const printIdx = args.indexOf('--print')
   if (printIdx !== -1) {
@@ -418,9 +422,18 @@ async function main() {
   console.log(chalk.dim('  permissions: ') + modeLabel)
   console.log(chalk.dim(`  memory: ${memoryManager.memoryPath}`))
   console.log(chalk.dim(`  thinking: ${formatThinkingConfig(thinkingConfig)}`))
+  const hookCount = hookManager.getHooks().length
+  if (hookCount > 0) {
+    console.log(chalk.dim(`  hooks: ${hookCount} configured`))
+  }
   if (claudeMd) console.log(chalk.dim('  CLAUDE.md: loaded'))
   console.log(chalk.dim('  type /help for commands'))
   console.log()
+
+  // Fire SessionStart hooks
+  if (hookCount > 0) {
+    hookManager.execute('SessionStart', {}).catch(() => {/* best-effort */})
+  }
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -486,6 +499,7 @@ async function main() {
 
     // --- Slash commands ---
     if (input === '/exit' || input === '/quit') {
+      await hookManager.execute('SessionEnd', {}).catch(() => {})
       await sessionManager.flush()
       console.log(chalk.dim('  bye.'))
       process.exit(0)
@@ -657,12 +671,31 @@ async function main() {
       prompt()
       return
     }
+    if (input === '/hooks') {
+      const hooks = hookManager.getHooks()
+      if (hooks.length === 0) {
+        console.log(chalk.yellow('  No hooks configured.'))
+        console.log(chalk.dim('  Configure hooks in ~/.occ/hooks.json'))
+      } else {
+        console.log(chalk.yellow(`  ${hooks.length} hook(s) configured:`))
+        for (const h of hooks) {
+          const match = h.match ? chalk.cyan(` [${h.match}]`) : ''
+          const timeout = h.timeout ? chalk.dim(` (${h.timeout}ms)`) : ''
+          console.log(chalk.dim(`  ${h.event}`) + match + timeout)
+          console.log(chalk.dim(`    $ ${h.command.length > 80 ? h.command.slice(0, 80) + '...' : h.command}`))
+        }
+        console.log(chalk.dim('  File: ~/.occ/hooks.json'))
+      }
+      prompt()
+      return
+    }
     if (input === '/help') {
       console.log(chalk.dim('  /exit        quit'))
       console.log(chalk.dim('  /clear       clear conversation'))
       console.log(chalk.dim('  /compact     compact conversation context'))
       console.log(chalk.dim('  /cost        show token usage & USD cost'))
       console.log(chalk.dim('  /doctor      run system diagnostics'))
+      console.log(chalk.dim('  /hooks       list configured lifecycle hooks'))
       console.log(chalk.dim('  /memory      list saved memories'))
       console.log(chalk.dim('  /mcp         show MCP servers and tools'))
       console.log(chalk.dim('  /model       show or switch model'))
@@ -719,8 +752,10 @@ async function main() {
         abortSignal: abortController.signal,
         toolContext: { cwd },
         permissionCheck: (toolName, toolInput) => permissionManager.check(toolName, toolInput),
-        onCompact: async (msgs) => {
-          const result = await contextManager.compact(msgs, provider, model)
+        onCompact: async (msgs, opts) => {
+          const result = opts?.force
+            ? await contextManager.forceCompact(msgs, provider, model)
+            : await contextManager.compact(msgs, provider, model)
           if (result.compacted) {
             console.log(chalk.yellow('  (context compacted)'))
             return result.messages
@@ -820,6 +855,7 @@ async function main() {
   })
 
   rl.on('close', async () => {
+    await hookManager.execute('SessionEnd', {}).catch(() => {})
     await sessionManager.flush()
     console.log(chalk.dim('\n  bye.'))
     process.exit(0)

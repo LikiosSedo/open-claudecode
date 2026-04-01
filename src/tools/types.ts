@@ -50,6 +50,13 @@ export interface Tool<TInput = unknown> {
 
   /** Keywords for ToolSearch matching (3-10 words) */
   searchHint?: string
+
+  /**
+   * Optional dynamic prompt fragment contributed by this tool.
+   * Appended to system prompt dynamic block. Design from Claude Code
+   * where each tool has its own prompt.ts contributing usage instructions.
+   */
+  toolPrompt?: () => string
 }
 
 export interface ToolContext {
