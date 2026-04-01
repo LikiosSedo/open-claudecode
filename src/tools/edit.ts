@@ -11,6 +11,7 @@
 import { z } from 'zod'
 import { readFile, writeFile } from 'fs/promises'
 import { resolve } from 'path'
+import chalk from 'chalk'
 import type { Tool, ToolContext, ToolResult } from './types.js'
 
 const inputSchema = z.object({
@@ -68,16 +69,16 @@ the edit fails unless replace_all is true — provide more surrounding context t
 
       const replaced = input.replace_all ? occurrences : 1
 
-      // Build a simple diff showing the change in context
+      // Build a colored diff showing the change in context
       const oldLines = input.old_string.split('\n')
       const newLines = input.new_string.split('\n')
       const diff = [
         `Edited ${filePath}: replaced ${replaced} occurrence(s)`,
         '',
-        '--- before',
-        ...oldLines.map(l => `- ${l}`),
-        '+++ after',
-        ...newLines.map(l => `+ ${l}`),
+        chalk.dim('--- before'),
+        ...oldLines.map(l => chalk.red(`- ${l}`)),
+        chalk.dim('+++ after'),
+        ...newLines.map(l => chalk.green(`+ ${l}`)),
       ].join('\n')
 
       return { output: diff }

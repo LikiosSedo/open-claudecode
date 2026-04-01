@@ -11,6 +11,9 @@
  */
 
 import * as readline from 'node:readline'
+import { readFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 import chalk from 'chalk'
 import { AnthropicProvider } from './providers/anthropic.js'
 import { OpenAIProvider } from './providers/openai.js'
@@ -32,6 +35,74 @@ import { PermissionManager, type PermissionMode } from './permissions.js'
 import { MemoryManager, loadClaudeMdFiles } from './memory.js'
 import { MemoryTool, setMemoryManager } from './tools/memory-tool.js'
 import { SessionManager } from './session.js'
+import { renderMarkdown, renderInline } from './render.js'
+import { runDiagnostics, formatDiagnostics } from './doctor.js'
+
+// --- Input History Persistence ---
+
+const HISTORY_FILE = join(homedir(), '.occ', 'input_history')
+const MAX_HISTORY = 500
+
+function loadInputHistory(): string[] {
+  try {
+    if (!existsSync(HISTORY_FILE)) return []
+    const lines = readFileSync(HISTORY_FILE, 'utf-8').split('\n').filter(Boolean)
+    return lines.slice(-MAX_HISTORY).reverse() // readline expects newest-first
+  } catch { return [] }
+}
+
+function appendInputHistory(input: string): void {
+  try {
+    // Deduplicate: read last line and skip if identical
+    if (existsSync(HISTORY_FILE)) {
+      const content = readFileSync(HISTORY_FILE, 'utf-8')
+      const lines = content.split('\n').filter(Boolean)
+      if (lines.length > 0 && lines[lines.length - 1] === input) return
+    }
+    mkdirSync(join(homedir(), '.occ'), { recursive: true })
+    appendFileSync(HISTORY_FILE, input + '\n')
+  } catch { /* best-effort */ }
+}
+
+// --- Loading Spinner ---
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+class Spinner {
+  private interval: NodeJS.Timeout | null = null
+  private frame = 0
+  private startTime = 0
+
+  start(message = 'thinking'): void {
+    this.startTime = Date.now()
+    this.frame = 0
+    this.interval = setInterval(() => {
+      const elapsed = ((Date.now() - this.startTime) / 1000).toFixed(1)
+      const f = SPINNER_FRAMES[this.frame % SPINNER_FRAMES.length]!
+      process.stderr.write(`\r${chalk.cyan(f)} ${chalk.dim(message)}${chalk.dim(` ${elapsed}s`)}`)
+      this.frame++
+    }, 80)
+  }
+
+  stop(): void {
+    if (this.interval) {
+      clearInterval(this.interval)
+      this.interval = null
+      process.stderr.write('\r' + ' '.repeat(40) + '\r') // clear spinner line
+    }
+  }
+}
+
+// --- Terminal Notification ---
+
+function notifyCompletion(message: string): void {
+  // Terminal bell (most widely supported)
+  process.stderr.write('\x07')
+  // OSC 9 notification (iTerm2, Kitty, Ghostty)
+  process.stderr.write(`\x1b]9;${message}\x1b\\`)
+  // OSC 777 notification (rxvt-unicode)
+  process.stderr.write(`\x1b]777;notify;occ;${message}\x1b\\`)
+}
 
 // --- Provider Selection ---
 
@@ -331,6 +402,8 @@ async function main() {
     input: process.stdin,
     output: process.stdout,
     prompt: chalk.cyan('occ> '),
+    history: loadInputHistory(),
+    historySize: MAX_HISTORY,
   })
 
   /** Update prompt with cost and context usage indicators. */
@@ -540,24 +613,39 @@ async function main() {
       prompt()
       return
     }
+    if (input === '/doctor') {
+      const results = await runDiagnostics({ cwd, provider: provider.name, model })
+      console.log(chalk.bold('\n  System Diagnostics\n'))
+      console.log(formatDiagnostics(results))
+      console.log()
+      prompt()
+      return
+    }
     if (input === '/help') {
       console.log(chalk.dim('  /exit        quit'))
       console.log(chalk.dim('  /clear       clear conversation'))
       console.log(chalk.dim('  /compact     compact conversation context'))
-      console.log(chalk.dim('  /model       show or switch model'))
       console.log(chalk.dim('  /cost        show token usage & USD cost'))
+      console.log(chalk.dim('  /doctor      run system diagnostics'))
       console.log(chalk.dim('  /memory      list saved memories'))
       console.log(chalk.dim('  /mcp         show MCP servers and tools'))
+      console.log(chalk.dim('  /model       show or switch model'))
       console.log(chalk.dim('  /permissions show or switch permission mode'))
-      console.log(chalk.dim('  /session     show current session ID'))
       console.log(chalk.dim('  /resume      list/resume sessions'))
+      console.log(chalk.dim('  /session     show current session ID'))
       prompt()
       return
     }
 
     // --- Agent turn ---
+    // Persist input history (skip slash commands and empty lines)
+    if (!input.startsWith('/') && input.length > 0) {
+      appendInputHistory(input)
+    }
+
     rl.pause()
     abortController = new AbortController()
+    const turnStartTime = Date.now()
 
     // Context compaction before next turn
     if (contextManager.needsCompaction(messages)) {
@@ -577,6 +665,11 @@ async function main() {
     // Build system prompt: blocks[0]=static (cached), blocks[1]=dynamic
     const deferredToolNames = tools.deferredTools().map(t => t.name)
     const systemPrompt = buildSystemPrompt({ cwd, gitContext, claudeMd, memoryIndex, deferredToolNames })
+
+    // Start spinner just before API call
+    const spinner = new Spinner()
+    let spinnerStopped = false
+    spinner.start()
 
     try {
       const stream = agentLoop({
@@ -603,17 +696,20 @@ async function main() {
       for await (const event of stream) {
         switch (event.type) {
           case 'text_delta':
-            process.stdout.write(event.text)
+            if (!spinnerStopped) { spinner.stop(); spinnerStopped = true }
+            process.stdout.write(renderInline(event.text))
             lastWasText = true
             break
 
           case 'thinking_delta':
+            if (!spinnerStopped) { spinner.stop(); spinnerStopped = true }
             // Optionally show thinking (dimmed)
             process.stdout.write(chalk.dim(event.thinking))
             lastWasText = true
             break
 
           case 'tool_start':
+            if (!spinnerStopped) { spinner.stop(); spinnerStopped = true }
             if (lastWasText) { console.log(); lastWasText = false }
             console.log(chalk.dim('  ') + chalk.cyan.bold(event.name) + chalk.dim(` [${event.id.slice(0, 8)}]`))
             break
@@ -624,11 +720,23 @@ async function main() {
 
           case 'tool_result':
             if (event.isError) {
-              console.log(chalk.red(`    ✗ ${event.result.slice(0, 200)}`))
+              console.log(chalk.red(`    \u2717 ${event.result.slice(0, 200)}`))
             } else {
               const lines = event.result.split('\n')
-              const preview = lines.slice(0, 3).map(l => `    ${l}`).join('\n')
-              console.log(chalk.dim(preview + (lines.length > 3 ? `\n    ... (${lines.length} lines)` : '')))
+              // Detect diff output (contains - and + lines) and colorize
+              const hasDiff = lines.some(l => l.startsWith('- ')) && lines.some(l => l.startsWith('+ '))
+              if (hasDiff) {
+                const preview = lines.slice(0, 8).map(l => {
+                  if (l.startsWith('- ')) return chalk.red(`    ${l}`)
+                  if (l.startsWith('+ ')) return chalk.green(`    ${l}`)
+                  if (l.startsWith('--- ') || l.startsWith('+++ ')) return chalk.dim(`    ${l}`)
+                  return chalk.dim(`    ${l}`)
+                }).join('\n')
+                console.log(preview + (lines.length > 8 ? chalk.dim(`\n    ... (${lines.length} lines)`) : ''))
+              } else {
+                const preview = lines.slice(0, 3).map(l => `    ${l}`).join('\n')
+                console.log(chalk.dim(preview + (lines.length > 3 ? `\n    ... (${lines.length} lines)` : '')))
+              }
             }
             break
 
@@ -636,7 +744,8 @@ async function main() {
             accumulateUsage(event.usage)
             break
 
-          case 'message_complete':
+          case 'message_complete': {
+            if (!spinnerStopped) { spinner.stop(); spinnerStopped = true }
             if (lastWasText) console.log()
             accumulateUsage(event.totalUsage)
             // Sync messages back (agent loop may have added assistant + tool_result messages)
@@ -650,10 +759,17 @@ async function main() {
                 savedMessageCount = messages.length
               }
             }
+            // Notify if turn took > 10 seconds
+            const turnElapsed = Date.now() - turnStartTime
+            if (turnElapsed > 10_000) {
+              notifyCompletion(`Done (${(turnElapsed / 1000).toFixed(0)}s)`)
+            }
             break
+          }
         }
       }
     } catch (err) {
+      if (!spinnerStopped) { spinner.stop(); spinnerStopped = true }
       if ((err as Error).name !== 'AbortError') {
         console.error(chalk.red(`\n  Error: ${(err as Error).message ?? err}`))
       }
