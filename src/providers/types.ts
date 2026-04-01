@@ -70,6 +70,8 @@ export interface ProviderOptions {
     | { type: 'disabled' }
     | { type: 'adaptive' }
     | { type: 'enabled'; budgetTokens: number }
+  /** Structured output: force the model to respond with JSON matching this schema */
+  outputSchema?: { name: string; schema: Record<string, unknown> }
 }
 
 export interface Provider {

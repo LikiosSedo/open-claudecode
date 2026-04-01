@@ -58,6 +58,16 @@ export class OpenAIProvider implements Provider {
           tools: openaiTools.length > 0 ? openaiTools : undefined,
           stream: true,
           stream_options: { include_usage: true },
+          ...(options.outputSchema ? {
+            response_format: {
+              type: 'json_schema' as const,
+              json_schema: {
+                name: options.outputSchema.name,
+                schema: options.outputSchema.schema,
+                strict: true,
+              },
+            },
+          } : {}),
         })
       } catch (err) {
         lastError = err

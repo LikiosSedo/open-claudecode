@@ -32,6 +32,7 @@ import {
   isPromptTooLong,
 } from './messages.js'
 import type { HookManager } from './hooks.js'
+import { FileReadCache } from './file-cache.js'
 
 // -- AgentEvent: unified event stream yielded by agentLoop() --
 
@@ -451,6 +452,7 @@ export async function* agentLoop(
     permissionCheck: baseContext.permissionCheck ?? permissionCheck,
     agentDepth: baseContext.agentDepth ?? 0,
     readFileState: baseContext.readFileState ?? new Map(),
+    fileCache: baseContext.fileCache ?? new FileReadCache(),
   }
 
   // Copy so the caller's array isn't mutated

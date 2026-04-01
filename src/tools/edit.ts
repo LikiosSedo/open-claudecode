@@ -66,6 +66,7 @@ the edit fails unless replace_all is true — provide more surrounding context t
         : content.replace(input.old_string, input.new_string)
 
       await writeFile(filePath, newContent, 'utf-8')
+      context.fileCache?.invalidate(filePath)
 
       const replaced = input.replace_all ? occurrences : 1
 

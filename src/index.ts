@@ -277,6 +277,9 @@ async function main() {
     permissionMode = 'ask'
   }
 
+  // --- Sandbox Mode ---
+  const sandboxEnabled = args.includes('--sandbox')
+
   // --- Session Manager ---
   const sessionManager = new SessionManager()
   let resumeSessionId: string | undefined
@@ -350,7 +353,7 @@ async function main() {
       messages: printMessages,
       tools,
       systemPrompt,
-      toolContext: { cwd },
+      toolContext: { cwd, sandbox: sandboxEnabled },
       // --print mode: tools execute without confirmation (like --bypass-permissions).
       // Only use in trusted contexts (local dev, CI with sandboxed env).
       permissionCheck: undefined,
@@ -420,6 +423,8 @@ async function main() {
   }
   const modeLabel = permissionMode === 'bypass' ? chalk.red(permissionMode) : chalk.green(permissionMode)
   console.log(chalk.dim('  permissions: ') + modeLabel)
+  const sandboxLabel = sandboxEnabled ? chalk.green('enabled') : chalk.dim('disabled')
+  console.log(chalk.dim('  sandbox: ') + sandboxLabel)
   console.log(chalk.dim(`  memory: ${memoryManager.memoryPath}`))
   console.log(chalk.dim(`  thinking: ${formatThinkingConfig(thinkingConfig)}`))
   const hookCount = hookManager.getHooks().length
@@ -750,7 +755,7 @@ async function main() {
         systemPrompt,
         thinking: thinkingConfig,
         abortSignal: abortController.signal,
-        toolContext: { cwd },
+        toolContext: { cwd, sandbox: sandboxEnabled },
         permissionCheck: (toolName, toolInput) => permissionManager.check(toolName, toolInput),
         onCompact: async (msgs, opts) => {
           const result = opts?.force

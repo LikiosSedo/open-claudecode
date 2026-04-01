@@ -9,11 +9,52 @@
 
 import { z } from 'zod'
 import { spawn } from 'child_process'
+import { platform, homedir } from 'node:os'
 import type { Tool, ToolContext, ToolResult } from './types.js'
+
+/**
+ * macOS seatbelt profile for sandbox-exec.
+ * - Allow read everywhere
+ * - Allow write only to cwd, /tmp, /private/tmp, and ~/.occ/
+ * - Allow network access
+ * - Allow process execution
+ */
+function seatbeltProfile(cwd: string): string {
+  const home = homedir()
+  return `(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+  (subpath "${cwd}")
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "${home}/.occ")
+  (subpath "/dev")
+)`
+}
+
+/** Wrap a command with sandbox-exec on macOS when sandbox mode is active. */
+function wrapWithSandbox(command: string, cwd: string, dangerouslyDisable?: boolean): string {
+  if (dangerouslyDisable) return command
+  if (platform() !== 'darwin') {
+    console.error('[sandbox] Warning: sandbox mode is macOS-only, running without sandbox')
+    return command
+  }
+  const profile = seatbeltProfile(cwd)
+  // Escape single quotes in profile for shell embedding
+  const escaped = profile.replace(/'/g, "'\\''")
+  return `sandbox-exec -p '${escaped}' bash -c ${shellQuote(command)}`
+}
+
+/** Shell-quote a string for embedding in a single-quoted context. */
+function shellQuote(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'"
+}
 
 const inputSchema = z.object({
   command: z.string().describe('The shell command to execute'),
   timeout: z.number().optional().describe('Timeout in milliseconds (default: 120000)'),
+  dangerouslyDisableSandbox: z.boolean().optional().describe('Skip sandbox wrapping even if sandbox mode is on'),
 })
 
 type Input = z.infer<typeof inputSchema>
@@ -36,9 +77,12 @@ Prefer dedicated tools (Read, Write, Edit, Glob, Grep) over bash for file operat
 
   async execute(input: Input, context: ToolContext): Promise<ToolResult> {
     const timeout = input.timeout ?? 120_000
+    const command = context.sandbox
+      ? wrapWithSandbox(input.command, context.cwd, input.dangerouslyDisableSandbox)
+      : input.command
 
     return new Promise((resolve) => {
-      const proc = spawn('bash', ['-c', input.command], {
+      const proc = spawn('bash', ['-c', command], {
         cwd: context.cwd,
         env: { ...process.env, TERM: 'dumb' },
         timeout,

@@ -8,7 +8,7 @@
  */
 
 import { z } from 'zod'
-import { readFile } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
 import { resolve } from 'path'
 import type { Tool, ToolContext, ToolResult } from './types.js'
 
@@ -31,7 +31,9 @@ Use offset and limit for large files. Supports text files, not binary.`,
   async execute(input: Input, context: ToolContext): Promise<ToolResult> {
     const filePath = resolve(context.cwd, input.file_path)
     try {
-      const content = await readFile(filePath, 'utf-8')
+      const content = context.fileCache
+        ? await context.fileCache.readFile(filePath)
+        : await readFile(filePath, 'utf-8')
 
       // Detect binary files by checking for null bytes
       if (content.includes('\0')) {

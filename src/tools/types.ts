@@ -11,6 +11,7 @@
 import { z } from 'zod'
 import { zodToJsonSchema as zodToJson } from 'zod-to-json-schema'
 import type { Provider } from '../providers/types.js'
+import type { FileReadCache } from '../file-cache.js'
 
 // --- Core Tool Interface ---
 
@@ -75,12 +76,18 @@ export interface ToolContext {
   permissionCheck?: (toolName: string, input: Record<string, unknown>) => Promise<PermissionDecision>
   /** Current nesting depth. 0 = root agent. Used to enforce max recursion depth. */
   agentDepth?: number
+  // --- Sandbox mode (macOS sandbox-exec) ---
+  /** When true, Bash commands are wrapped in a macOS seatbelt sandbox. */
+  sandbox?: boolean
   // --- Streaming progress callback (used by Bash for real-time output) ---
   /** Called by tools to push incremental output while still executing. */
   onProgress?: (data: { output: string; isPartial: boolean }) => void
   // --- Read-before-edit tracking ---
   /** Tracks which files have been read in this session. Used by Edit/Write to enforce read-before-edit. */
   readFileState?: Map<string, { timestamp: number }>
+  // --- File read cache ---
+  /** Caches file contents with mtime-based invalidation. Shared across tools. */
+  fileCache?: FileReadCache
 }
 
 export interface ToolResult {

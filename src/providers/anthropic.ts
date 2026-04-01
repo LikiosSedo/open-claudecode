@@ -79,6 +79,18 @@ export class AnthropicProvider implements Provider {
           stream: true,
         }
 
+        // Add structured output via native JSON schema format
+        if (options.outputSchema) {
+          params.output_config = {
+            format: {
+              type: 'json_schema',
+              name: options.outputSchema.name,
+              schema: options.outputSchema.schema,
+            },
+          }
+          params.betas = ['structured-outputs-2025-12-15']
+        }
+
         // Add thinking configuration
         if (options.thinking) {
           if (options.thinking.type === 'enabled') {

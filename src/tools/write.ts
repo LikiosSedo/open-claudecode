@@ -42,6 +42,7 @@ Parent directories are created automatically.`,
 
       await mkdir(dirname(filePath), { recursive: true })
       await writeFile(filePath, input.content, 'utf-8')
+      context.fileCache?.invalidate(filePath)
       const lines = input.content.split('\n').length
       const suffix = existed ? ' (overwritten)' : ''
       return { output: `File written: ${filePath} (${lines} lines)${suffix}` }
