@@ -83,13 +83,58 @@ function formatUsage(): string {
   return parts.join(' | ')
 }
 
+// --- USD Cost Calculation ---
+
+/** Pricing per million tokens */
+const MODEL_COSTS: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
+  // Claude Sonnet 4
+  'claude-sonnet-4': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  'claude-sonnet-4-20250514': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  // Claude Opus 4
+  'claude-opus-4': { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  'claude-opus-4-20250514': { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  // Claude Haiku 3.5
+  'claude-haiku-4-5': { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 },
+  // Claude 3.5 Sonnet
+  'claude-3-5-sonnet': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  // OpenAI
+  'gpt-4o': { input: 2.5, output: 10, cacheRead: 1.25, cacheWrite: 2.5 },
+  'gpt-4o-mini': { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0.15 },
+  'o3-mini': { input: 1.1, output: 4.4, cacheRead: 0.55, cacheWrite: 1.1 },
+}
+
+/** Find best matching model cost by prefix. E.g. "claude-sonnet-4-20250514" matches "claude-sonnet-4". */
+function findModelCosts(model: string): { input: number; output: number; cacheRead: number; cacheWrite: number } | null {
+  // Exact match first
+  if (MODEL_COSTS[model]) return MODEL_COSTS[model]
+  // Prefix match: find the longest matching key
+  let bestMatch: string | null = null
+  for (const key of Object.keys(MODEL_COSTS)) {
+    if (model.startsWith(key) && (!bestMatch || key.length > bestMatch.length)) {
+      bestMatch = key
+    }
+  }
+  return bestMatch ? MODEL_COSTS[bestMatch]! : null
+}
+
+function calculateCostUSD(model: string, usage: typeof totalUsage): number {
+  const costs = findModelCosts(model)
+  if (!costs) return 0
+  return (
+    (usage.inputTokens / 1_000_000) * costs.input +
+    (usage.outputTokens / 1_000_000) * costs.output +
+    (usage.cacheReadTokens / 1_000_000) * costs.cacheRead +
+    (usage.cacheWriteTokens / 1_000_000) * costs.cacheWrite
+  )
+}
+
 // --- Main ---
 
 // --- Permission Prompt ---
 
-/** Prompt user for permission confirmation via readline. */
+/** Prompt user for permission confirmation via readline. Returns 'y' | 'a' | 'n'. */
 function createPermissionPrompter(rl: readline.Interface) {
-  return async (toolName: string, input: Record<string, unknown>, message: string): Promise<boolean> => {
+  return async (toolName: string, input: Record<string, unknown>, message: string): Promise<'y' | 'a' | 'n'> => {
     // Format a concise summary of what the tool wants to do
     let detail = ''
     if (toolName === 'Bash' && typeof input.command === 'string') {
@@ -104,13 +149,18 @@ function createPermissionPrompter(rl: readline.Interface) {
     if (detail) console.log(chalk.yellow(detail))
     console.log(chalk.dim(`  reason: ${message}`))
 
-    return new Promise<boolean>((resolve) => {
-      rl.question(chalk.yellow('  Allow? [y/N] '), (answer) => {
-        const allowed = answer.trim().toLowerCase() === 'y'
-        if (!allowed) {
+    return new Promise<'y' | 'a' | 'n'>((resolve) => {
+      rl.question(chalk.yellow('  Allow? [y/a(lways)/N] '), (answer) => {
+        const a = answer.trim().toLowerCase()
+        if (a === 'a') {
+          console.log(chalk.green('  always allowed (saved).'))
+          resolve('a')
+        } else if (a === 'y') {
+          resolve('y')
+        } else {
           console.log(chalk.red('  denied.'))
+          resolve('n')
         }
-        resolve(allowed)
       })
     })
   }
@@ -283,13 +333,40 @@ async function main() {
     prompt: chalk.cyan('occ> '),
   })
 
+  /** Update prompt with cost and context usage indicators. */
+  function updatePrompt(): void {
+    const statusParts: string[] = []
+    const cost = calculateCostUSD(model, totalUsage)
+    if (cost > 0) statusParts.push(`$${cost.toFixed(2)}`)
+    if (messages.length > 0) {
+      const ctxPercent = contextManager.getUsagePercent(messages)
+      if (ctxPercent > 0) {
+        let ctxStr = `ctx:${ctxPercent}%`
+        if (ctxPercent >= 95) {
+          ctxStr = chalk.red(ctxStr)
+        } else if (ctxPercent >= 80) {
+          ctxStr = chalk.yellow(ctxStr)
+        }
+        statusParts.push(ctxStr)
+      }
+    }
+    const status = statusParts.length > 0 ? chalk.dim(` [${statusParts.join(' | ')}]`) : ''
+    rl.setPrompt(chalk.cyan('occ> ') + status + ' ')
+  }
+
+  /** Update prompt indicators and show prompt. */
+  function prompt(): void {
+    updatePrompt()
+    rl.prompt()
+  }
+
   // --- Permission Manager (needs rl for interactive prompts) ---
   const permissionManager = new PermissionManager({
     mode: permissionMode,
     askUser: createPermissionPrompter(rl),
   })
 
-  rl.prompt()
+  prompt()
 
   let abortController: AbortController | null = null
 
@@ -299,16 +376,16 @@ async function main() {
       abortController.abort()
       abortController = null
       console.log(chalk.yellow('\n  (interrupted)'))
-      rl.prompt()
+      prompt()
     } else {
       console.log(chalk.dim('\n  (use /exit to quit)'))
-      rl.prompt()
+      prompt()
     }
   })
 
   rl.on('line', async (line) => {
     const input = line.trim()
-    if (!input) { rl.prompt(); return }
+    if (!input) { prompt(); return }
 
     // --- Slash commands ---
     if (input === '/exit' || input === '/quit') {
@@ -322,12 +399,16 @@ async function main() {
       // Start a fresh session
       await sessionManager.createSession(cwd, model)
       console.log(chalk.yellow(`  conversation cleared. new session: ${sessionManager.currentSessionId}`))
-      rl.prompt()
+      prompt()
       return
     }
     if (input === '/cost') {
       console.log(chalk.yellow(`  ${formatUsage()}`))
-      rl.prompt()
+      const cost = calculateCostUSD(model, totalUsage)
+      if (cost > 0) {
+        console.log(chalk.yellow(`  cost: $${cost.toFixed(2)}`))
+      }
+      prompt()
       return
     }
     if (input.startsWith('/model')) {
@@ -338,7 +419,7 @@ async function main() {
       } else {
         console.log(chalk.yellow(`  current model: ${model}`))
       }
-      rl.prompt()
+      prompt()
       return
     }
     if (input === '/mcp') {
@@ -354,7 +435,7 @@ async function main() {
           }
         }
       }
-      rl.prompt()
+      prompt()
       return
     }
     if (input.startsWith('/permissions')) {
@@ -363,15 +444,29 @@ async function main() {
         permissionManager.setMode(newMode)
         const label = newMode === 'bypass' ? chalk.red(newMode) : chalk.green(newMode)
         console.log(chalk.yellow(`  permissions → `) + label)
+      } else if (newMode === 'rules') {
+        const rules = permissionManager.getRules()
+        if (rules.length === 0) {
+          console.log(chalk.yellow('  No persistent permission rules.'))
+        } else {
+          console.log(chalk.yellow(`  ${rules.length} persistent rule(s):`))
+          for (const r of rules) {
+            const pat = r.pattern ? ` "${r.pattern}"` : ''
+            const beh = r.behavior === 'allow' ? chalk.green(r.behavior) : chalk.red(r.behavior)
+            console.log(chalk.dim(`    ${r.toolName}${pat} → `) + beh)
+          }
+        }
+        console.log(chalk.dim('  File: ~/.occ/permissions.json'))
       } else if (newMode) {
-        console.log(chalk.red(`  Unknown mode: ${newMode}. Use auto, ask, or bypass.`))
+        console.log(chalk.red(`  Unknown mode: ${newMode}. Use auto, ask, bypass, or rules.`))
       } else {
         const currentMode = permissionManager.getMode()
         const label = currentMode === 'bypass' ? chalk.red(currentMode) : chalk.green(currentMode)
         console.log(chalk.yellow('  permissions: ') + label)
         console.log(chalk.dim('  modes: auto (smart per-tool), ask (confirm all), bypass (allow all)'))
+        console.log(chalk.dim('  /permissions rules — show persistent always-allow rules'))
       }
-      rl.prompt()
+      prompt()
       return
     }
     if (input === '/memory') {
@@ -386,12 +481,12 @@ async function main() {
         }
         console.log(chalk.dim(`  Directory: ${memoryManager.memoryPath}`))
       }
-      rl.prompt()
+      prompt()
       return
     }
     if (input === '/session') {
       console.log(chalk.yellow(`  session: ${sessionManager.currentSessionId}`))
-      rl.prompt()
+      prompt()
       return
     }
     if (input === '/resume' || input.startsWith('/resume ')) {
@@ -421,20 +516,42 @@ async function main() {
           console.log(chalk.dim('  Usage: /resume <session-id>'))
         }
       }
-      rl.prompt()
+      prompt()
+      return
+    }
+    if (input === '/compact' || input.startsWith('/compact ')) {
+      if (messages.length === 0) {
+        console.log(chalk.yellow('  nothing to compact.'))
+        prompt()
+        return
+      }
+      console.log(chalk.yellow('  compacting conversation...'))
+      const result = await contextManager.compact(messages, provider, model)
+      if (result.compacted) {
+        messages = result.messages
+        const percent = contextManager.getUsagePercent(messages)
+        console.log(chalk.green(`  compacted. context: ${percent}%`))
+        if (result.summary) {
+          console.log(chalk.dim(`  summary: ${result.summary.slice(0, 200)}...`))
+        }
+      } else {
+        console.log(chalk.yellow('  nothing to compact.'))
+      }
+      prompt()
       return
     }
     if (input === '/help') {
       console.log(chalk.dim('  /exit        quit'))
       console.log(chalk.dim('  /clear       clear conversation'))
+      console.log(chalk.dim('  /compact     compact conversation context'))
       console.log(chalk.dim('  /model       show or switch model'))
-      console.log(chalk.dim('  /cost        show token usage'))
+      console.log(chalk.dim('  /cost        show token usage & USD cost'))
       console.log(chalk.dim('  /memory      list saved memories'))
       console.log(chalk.dim('  /mcp         show MCP servers and tools'))
       console.log(chalk.dim('  /permissions show or switch permission mode'))
       console.log(chalk.dim('  /session     show current session ID'))
       console.log(chalk.dim('  /resume      list/resume sessions'))
-      rl.prompt()
+      prompt()
       return
     }
 
@@ -501,6 +618,10 @@ async function main() {
             console.log(chalk.dim('  ') + chalk.cyan.bold(event.name) + chalk.dim(` [${event.id.slice(0, 8)}]`))
             break
 
+          case 'tool_progress':
+            process.stdout.write(chalk.dim(event.output))
+            break
+
           case 'tool_result':
             if (event.isError) {
               console.log(chalk.red(`    ✗ ${event.result.slice(0, 200)}`))
@@ -541,7 +662,7 @@ async function main() {
     abortController = null
     console.log()
     rl.resume()
-    rl.prompt()
+    prompt()
   })
 
   rl.on('close', async () => {

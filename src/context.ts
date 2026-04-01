@@ -89,6 +89,12 @@ export class ContextManager {
     return messages.reduce((sum, m) => sum + messageTokens(m), 0)
   }
 
+  /** Return context usage as a percentage (0–100). */
+  getUsagePercent(messages: Message[]): number {
+    const tokens = this.estimateTokens(messages)
+    return Math.min(100, Math.round((tokens / this.budget) * 100))
+  }
+
   needsCompaction(messages: Message[]): boolean {
     if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return false
     return this.estimateTokens(messages) >= this.budget * this.compactThreshold

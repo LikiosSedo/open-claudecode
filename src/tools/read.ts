@@ -54,6 +54,10 @@ Use offset and limit for large files. Supports text files, not binary.`,
       if (offset + limit < lines.length) {
         output += `\n... (${lines.length - offset - limit} more lines)`
       }
+
+      // Track successful reads for read-before-edit enforcement
+      context.readFileState?.set(filePath, { timestamp: Date.now() })
+
       return { output: output || '(empty file)' }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)

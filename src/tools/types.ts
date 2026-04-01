@@ -68,6 +68,12 @@ export interface ToolContext {
   permissionCheck?: (toolName: string, input: Record<string, unknown>) => Promise<PermissionDecision>
   /** Current nesting depth. 0 = root agent. Used to enforce max recursion depth. */
   agentDepth?: number
+  // --- Streaming progress callback (used by Bash for real-time output) ---
+  /** Called by tools to push incremental output while still executing. */
+  onProgress?: (data: { output: string; isPartial: boolean }) => void
+  // --- Read-before-edit tracking ---
+  /** Tracks which files have been read in this session. Used by Edit/Write to enforce read-before-edit. */
+  readFileState?: Map<string, { timestamp: number }>
 }
 
 export interface ToolResult {

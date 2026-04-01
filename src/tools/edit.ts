@@ -33,6 +33,15 @@ the edit fails unless replace_all is true — provide more surrounding context t
 
   async execute(input: Input, context: ToolContext): Promise<ToolResult> {
     const filePath = resolve(context.cwd, input.file_path)
+
+    // Enforce read-before-edit: LLM must read a file before editing it
+    if (context.readFileState && !context.readFileState.has(filePath)) {
+      return {
+        output: `Error: You must read ${filePath} before editing it. Use the Read tool first to see the current contents.`,
+        isError: true,
+      }
+    }
+
     try {
       const content = await readFile(filePath, 'utf-8')
       const occurrences = content.split(input.old_string).length - 1

@@ -40,8 +40,17 @@ Prefer dedicated tools (Read, Write, Edit, Glob, Grep) over bash for file operat
       let stdout = ''
       let stderr = ''
 
-      proc.stdout?.on('data', (data: Buffer) => { stdout += data.toString() })
-      proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString() })
+      proc.stdout?.on('data', (data: Buffer) => {
+        const chunk = data.toString()
+        stdout += chunk
+        context.onProgress?.({ output: chunk, isPartial: true })
+      })
+
+      proc.stderr?.on('data', (data: Buffer) => {
+        const chunk = data.toString()
+        stderr += chunk
+        context.onProgress?.({ output: chunk, isPartial: true })
+      })
 
       context.abortSignal?.addEventListener('abort', () => proc.kill('SIGTERM'))
 

@@ -38,6 +38,7 @@ export type AgentEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'thinking_delta'; thinking: string }
   | { type: 'tool_start'; name: string; id: string }
+  | { type: 'tool_progress'; name: string; id: string; output: string }
   | { type: 'tool_result'; name: string; id: string; result: string; isError: boolean }
   | { type: 'turn_complete'; stopReason: StopReason; usage: TokenUsage }
   | { type: 'message_complete'; messages: Message[]; totalUsage: TokenUsage }
@@ -57,6 +58,8 @@ type TrackedTool = {
   isConcurrencySafe: boolean
   promise?: Promise<void>
   result?: { output: string; isError: boolean }
+  /** Buffered progress chunks from onProgress callback, drained by getResults(). */
+  pendingProgress: string[]
 }
 
 export class StreamingToolExecutor {
@@ -87,6 +90,7 @@ export class StreamingToolExecutor {
       status: 'completed',
       isConcurrencySafe: true,
       result: { output: reason, isError: true },
+      pendingProgress: [],
     })
     this.wake()
   }
@@ -102,6 +106,7 @@ export class StreamingToolExecutor {
         status: 'completed',
         isConcurrencySafe: true,
         result: { output: `Error: No such tool: ${name}`, isError: true },
+        pendingProgress: [],
       })
       this.wake()
       return
@@ -111,6 +116,7 @@ export class StreamingToolExecutor {
       id, name, input, tool,
       status: 'queued',
       isConcurrencySafe: tool.isConcurrencySafe,
+      pendingProgress: [],
     })
 
     void this.processQueue()
@@ -122,23 +128,24 @@ export class StreamingToolExecutor {
     this.wake()
   }
 
-  /** Yield results in submission order. Promise.race waits for completions.
+  /** Yield results and progress in submission order. Promise.race waits for completions or progress.
    *  Non-concurrent tools block yielding of later tools. (cf. getRemainingResults) */
-  async *getResults(): AsyncGenerator<{
-    name: string
-    id: string
-    result: string
-    isError: boolean
-  }> {
+  async *getResults(): AsyncGenerator<
+    | { type: 'result'; name: string; id: string; result: string; isError: boolean }
+    | { type: 'progress'; name: string; id: string; output: string }
+  > {
     while (this.hasUnfinished()) {
       await this.processQueue()
 
+      // Drain any pending progress before yielding completed results
+      yield* this.drainProgress()
+
       // Yield completed results in order
       for (const yielded of this.yieldCompleted()) {
-        yield yielded
+        yield { type: 'result', ...yielded }
       }
 
-      // If still executing, wait for any tool to complete
+      // If still executing, wait for any tool to complete (or progress to arrive)
       if (this.hasExecuting() && !this.hasCompleted()) {
         const executingPromises = this.tools
           .filter(t => t.status === 'executing' && t.promise)
@@ -151,12 +158,26 @@ export class StreamingToolExecutor {
         if (executingPromises.length > 0) {
           await Promise.race([...executingPromises, wakePromise])
         }
+
+        // After waking, drain any progress that arrived
+        yield* this.drainProgress()
       }
     }
 
     // Final sweep — catch anything completed in the last iteration
+    yield* this.drainProgress()
     for (const yielded of this.yieldCompleted()) {
-      yield yielded
+      yield { type: 'result', ...yielded }
+    }
+  }
+
+  /** Drain all pending progress chunks from all tools. */
+  private *drainProgress(): Generator<{ type: 'progress'; name: string; id: string; output: string }> {
+    for (const tool of this.tools) {
+      if (tool.pendingProgress.length > 0) {
+        const output = tool.pendingProgress.splice(0).join('')
+        yield { type: 'progress', name: tool.name, id: tool.id, output }
+      }
     }
   }
 
@@ -202,9 +223,18 @@ export class StreamingToolExecutor {
       }
 
       try {
+        // Build per-tool context with onProgress callback for real-time streaming
+        const toolContextWithProgress: ToolContext = {
+          ...this.toolContext,
+          onProgress: (data) => {
+            tracked.pendingProgress.push(data.output)
+            this.wake()
+          },
+        }
+
         const toolResult: ToolResult = await tracked.tool!.execute(
           tracked.input,
-          this.toolContext,
+          toolContextWithProgress,
         )
 
         tracked.result = {
@@ -363,6 +393,7 @@ export async function* agentLoop(
     model: baseContext.model ?? model,
     permissionCheck: baseContext.permissionCheck ?? permissionCheck,
     agentDepth: baseContext.agentDepth ?? 0,
+    readFileState: baseContext.readFileState ?? new Map(),
   }
 
   // Copy so the caller's array isn't mutated
@@ -550,21 +581,26 @@ export async function* agentLoop(
       }
 
       const toolResultContents: UserContent[] = []
-      // Drain all results (cf. Claude Code getRemainingResults, query.ts:1380)
-      for await (const result of executor.getResults()) {
+      // Drain all results + progress (cf. Claude Code getRemainingResults, query.ts:1380)
+      for await (const event of executor.getResults()) {
+        if (event.type === 'progress') {
+          yield { type: 'tool_progress', name: event.name, id: event.id, output: event.output }
+          continue
+        }
+
         yield {
           type: 'tool_result',
-          name: result.name,
-          id: result.id,
-          result: result.result,
-          isError: result.isError,
+          name: event.name,
+          id: event.id,
+          result: event.result,
+          isError: event.isError,
         }
 
         toolResultContents.push({
           type: 'tool_result',
-          toolUseId: result.id,
-          content: result.result,
-          isError: result.isError || undefined,
+          toolUseId: event.id,
+          content: event.result,
+          isError: event.isError || undefined,
         })
       }
 

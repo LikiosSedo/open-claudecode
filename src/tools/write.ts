@@ -31,6 +31,15 @@ Parent directories are created automatically.`,
     try {
       let existed = false
       try { await access(filePath); existed = true } catch { /* does not exist */ }
+
+      // Enforce read-before-write for existing files: LLM must read before overwriting
+      if (existed && context.readFileState && !context.readFileState.has(filePath)) {
+        return {
+          output: `Error: File ${filePath} exists but hasn't been read. Read it first before overwriting.`,
+          isError: true,
+        }
+      }
+
       await mkdir(dirname(filePath), { recursive: true })
       await writeFile(filePath, input.content, 'utf-8')
       const lines = input.content.split('\n').length

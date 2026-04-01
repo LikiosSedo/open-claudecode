@@ -6,10 +6,39 @@
  *   - bypass: all operations allowed (like --dangerously-skip-permissions)
  *   - ask: all non-read-only operations require confirmation
  *   - auto (default): smart per-tool policy with bash command analysis
+ *
+ * Persistent rules: "always allow" rules are stored in ~/.occ/permissions.json
+ * so users don't re-approve the same operations every session.
  */
 
 import type { PermissionDecision } from './tools/types.js'
 import { analyzeCommand } from './bash-security.js'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+
+// -- Persistent Permission Rules --
+
+export interface PermissionRule {
+  toolName: string       // "Bash" or "mcp__github__search"
+  pattern?: string       // optional glob pattern, e.g. "git *" or "npm *"
+  behavior: 'allow' | 'deny'
+}
+
+interface PermissionRulesFile {
+  rules: PermissionRule[]
+}
+
+const RULES_PATH = join(homedir(), '.occ', 'permissions.json')
+
+/** Simple glob match: `*` matches any sequence of characters. */
+function globMatch(pattern: string, text: string): boolean {
+  // Escape regex special chars except *, then convert * to .*
+  const regex = new RegExp(
+    '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$',
+  )
+  return regex.test(text)
+}
 
 // -- Permission Modes --
 
@@ -179,17 +208,19 @@ function extractBaseCommand(command: string): string | null {
 
 export interface PermissionManagerOptions {
   mode: PermissionMode
-  /** Callback to ask user for confirmation. Returns true=allow, false=deny */
-  askUser: (toolName: string, input: Record<string, unknown>, message: string) => Promise<boolean>
+  /** Callback to ask user for confirmation. Returns 'y' | 'a' | 'n' */
+  askUser: (toolName: string, input: Record<string, unknown>, message: string) => Promise<'y' | 'a' | 'n'>
 }
 
 export class PermissionManager {
   private mode: PermissionMode
   private askUser: PermissionManagerOptions['askUser']
+  private rules: PermissionRule[] = []
 
   constructor(options: PermissionManagerOptions) {
     this.mode = options.mode
     this.askUser = options.askUser
+    this.rules = this.loadRules()
   }
 
   getMode(): PermissionMode {
@@ -200,20 +231,96 @@ export class PermissionManager {
     this.mode = mode
   }
 
+  // -- Persistent rules --
+
+  loadRules(): PermissionRule[] {
+    try {
+      const data = readFileSync(RULES_PATH, 'utf-8')
+      const parsed = JSON.parse(data) as PermissionRulesFile
+      return Array.isArray(parsed.rules) ? parsed.rules : []
+    } catch {
+      return []
+    }
+  }
+
+  addRule(rule: PermissionRule): void {
+    // Avoid duplicates
+    const exists = this.rules.some(
+      r => r.toolName === rule.toolName && r.pattern === rule.pattern && r.behavior === rule.behavior,
+    )
+    if (!exists) {
+      this.rules.push(rule)
+      this.saveRules()
+    }
+  }
+
+  getRules(): PermissionRule[] {
+    return [...this.rules]
+  }
+
+  private saveRules(): void {
+    const dir = join(homedir(), '.occ')
+    mkdirSync(dir, { recursive: true })
+    const data: PermissionRulesFile = { rules: this.rules }
+    writeFileSync(RULES_PATH, JSON.stringify(data, null, 2) + '\n', 'utf-8')
+  }
+
+  /** Match a persistent rule against a tool invocation. */
+  matchRule(toolName: string, input: Record<string, unknown>): PermissionRule | null {
+    for (const rule of this.rules) {
+      if (rule.toolName !== toolName) continue
+      if (!rule.pattern) {
+        // No pattern = matches all invocations of this tool
+        return rule
+      }
+      // For Bash, match against the command
+      if (toolName === 'Bash' && typeof input.command === 'string') {
+        if (globMatch(rule.pattern, input.command)) return rule
+      }
+      // For file-based tools, match against file_path
+      if (typeof input.file_path === 'string') {
+        if (globMatch(rule.pattern, input.file_path)) return rule
+      }
+    }
+    return null
+  }
+
+  /** Build a pattern string for the "always allow" rule from a tool invocation. */
+  buildPattern(toolName: string, input: Record<string, unknown>): string | undefined {
+    if (toolName === 'Bash' && typeof input.command === 'string') {
+      // Use the first word (base command) + " *" as pattern
+      const firstWord = input.command.trim().split(/\s+/)[0]
+      return firstWord ? `${firstWord} *` : undefined
+    }
+    return undefined
+  }
+
   /**
    * Check if a tool invocation should be allowed.
-   * For 'ask' decisions, prompts the user via the askUser callback.
+   * Checks persistent rules first, then falls back to askUser.
    */
   async check(toolName: string, input: Record<string, unknown>): Promise<PermissionDecision> {
+    // Check persistent rules before the built-in policy
+    const matchedRule = this.matchRule(toolName, input)
+    if (matchedRule) {
+      if (matchedRule.behavior === 'allow') return { behavior: 'allow' }
+      if (matchedRule.behavior === 'deny') return { behavior: 'deny', reason: `Denied by persistent rule` }
+    }
+
     const decision = this.decide(toolName, input)
 
     if (decision.behavior !== 'ask') {
       return decision
     }
 
-    // Ask user
-    const allowed = await this.askUser(toolName, input, decision.message)
-    if (allowed) {
+    // Ask user: y=once, a=always, n=deny
+    const answer = await this.askUser(toolName, input, decision.message)
+    if (answer === 'a') {
+      const pattern = this.buildPattern(toolName, input)
+      this.addRule({ toolName, pattern, behavior: 'allow' })
+      return { behavior: 'allow' }
+    }
+    if (answer === 'y') {
       return { behavior: 'allow' }
     }
     return { behavior: 'deny', reason: `User denied: ${toolName}` }

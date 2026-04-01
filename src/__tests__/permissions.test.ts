@@ -4,7 +4,7 @@ import { PermissionManager } from '../permissions.js'
 function createManager(mode: 'auto' | 'ask' | 'bypass') {
   return new PermissionManager({
     mode,
-    askUser: async () => false, // never called in decide()
+    askUser: async () => 'n' as const, // never called in decide()
   })
 }
 

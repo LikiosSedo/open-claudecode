@@ -27,7 +27,9 @@ const ctx: ToolContext = { cwd: '/tmp' }
 async function collectResults(executor: StreamingToolExecutor) {
   const results: Array<{ name: string; id: string; result: string; isError: boolean }> = []
   for await (const r of executor.getResults()) {
-    results.push(r)
+    if (r.type === 'result') {
+      results.push(r)
+    }
   }
   return results
 }
