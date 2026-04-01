@@ -9,6 +9,7 @@
  */
 
 import type { PermissionDecision } from './tools/types.js'
+import { analyzeCommand } from './bash-security.js'
 
 // -- Permission Modes --
 
@@ -111,13 +112,13 @@ function analyzeBashCommand(command: string): PermissionDecision {
         return { behavior: 'ask', message: `Compound command contains dangerous command: ${baseCmd}` }
       }
     }
-    // If all parts are safe commands, allow the compound command
+    // If all parts are safe commands, run deep security analysis before allowing
     const allSafe = parts.every(part => {
       const baseCmd = extractBaseCommand(part)
       return baseCmd !== null && SAFE_COMMANDS.has(baseCmd)
     })
     if (allSafe) {
-      return { behavior: 'allow' }
+      return deepSecurityAnalysis(trimmed)
     }
     return { behavior: 'ask', message: 'Compound command — cannot verify safety of all parts' }
   }
@@ -133,11 +134,24 @@ function analyzeBashCommand(command: string): PermissionDecision {
   }
 
   if (SAFE_COMMANDS.has(baseCmd)) {
-    return { behavior: 'allow' }
+    return deepSecurityAnalysis(trimmed)
   }
 
   // Unknown command — ask to be safe
   return { behavior: 'ask', message: `Unknown command: ${baseCmd}` }
+}
+
+/**
+ * Deep security analysis — runs after the fast allowlist/denylist checks.
+ * Catches injection vectors that simple command-name checks miss
+ * (command substitution, process substitution, IFS injection, etc.).
+ */
+function deepSecurityAnalysis(command: string): PermissionDecision {
+  const result = analyzeCommand(command)
+  if (!result.safe) {
+    return { behavior: 'ask', message: result.reason! }
+  }
+  return { behavior: 'allow' }
 }
 
 /**

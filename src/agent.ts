@@ -26,6 +26,11 @@ import type {
   ToolResult,
   PermissionDecision,
 } from './tools/types.js'
+import {
+  normalizeMessages,
+  ensureToolResultPairing,
+  isPromptTooLong,
+} from './messages.js'
 
 // -- AgentEvent: unified event stream yielded by agentLoop() --
 
@@ -363,11 +368,34 @@ export async function* agentLoop(
   // Copy so the caller's array isn't mutated
   const messages: Message[] = [...options.messages]
   let totalUsage: TokenUsage = { ...EMPTY_USAGE }
+  let reactiveCompactAttempts = 0
+  const MAX_REACTIVE_COMPACT_ATTEMPTS = 2
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    // Normalize messages before every API call: fix tool pairing + enforce alternation
+    const normalizedMessages = normalizeMessages(ensureToolResultPairing(messages))
+
     // Recompute schemas each turn: discover() may have added deferred tools
     const toolSchemas = tools.availableSchemas()
-    const stream = provider.stream(messages, toolSchemas, { model, maxTokens, systemPrompt, temperature })
+
+    let stream: AsyncIterable<import('./providers/types.js').StreamEvent>
+    try {
+      stream = provider.stream(normalizedMessages, toolSchemas, { model, maxTokens, systemPrompt, temperature })
+    } catch (err) {
+      // Synchronous errors from provider.stream() (e.g. pre-flight validation)
+      if (
+        isPromptTooLong(err) &&
+        options.onCompact &&
+        reactiveCompactAttempts < MAX_REACTIVE_COMPACT_ATTEMPTS
+      ) {
+        reactiveCompactAttempts++
+        const compacted = await options.onCompact(messages)
+        messages.length = 0
+        messages.push(...compacted)
+        continue // retry the turn with compacted messages
+      }
+      throw err
+    }
 
     const contentBlocks: AssistantContent[] = []
     let currentText = '', currentThinking = ''
@@ -377,6 +405,11 @@ export async function* agentLoop(
     let hasToolUse = false
     // New executor per turn (Claude Code: query.ts:562)
     const executor = new StreamingToolExecutor(tools, toolContext, abortSignal)
+
+    // Reactive compact: prompt-too-long errors surface during stream iteration
+    // (the API rejects with 400/413 on first chunk fetch). Catch, compact, retry.
+    let streamErrored = false
+    try {
 
     for await (const event of stream) {
       if (abortSignal?.aborted) break
@@ -473,6 +506,26 @@ export async function* agentLoop(
       }
     }
 
+    } catch (streamErr) {
+      // Reactive compact: if prompt-too-long, compact and retry the turn
+      if (
+        isPromptTooLong(streamErr) &&
+        options.onCompact &&
+        reactiveCompactAttempts < MAX_REACTIVE_COMPACT_ATTEMPTS
+      ) {
+        reactiveCompactAttempts++
+        const compacted = await options.onCompact(messages)
+        messages.length = 0
+        messages.push(...compacted)
+        streamErrored = true
+        // Fall through to continue — don't process the failed turn's results
+      } else {
+        throw streamErr
+      }
+    }
+
+    if (streamErrored) continue // retry the turn after reactive compact
+
     // Flush trailing text/thinking
     if (currentText) {
       contentBlocks.push({ type: 'text', text: currentText })
@@ -526,6 +579,7 @@ export async function* agentLoop(
     }
 
     totalUsage = addUsage(totalUsage, turnUsage)
+    reactiveCompactAttempts = 0 // reset on successful turn
     yield { type: 'turn_complete', stopReason, usage: turnUsage }
 
     // -- 4. Check if we should continue --
