@@ -1,6 +1,6 @@
 {
   "name": "open-claude-cli",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Open-source coding agent inspired by Claude Code. Multi-provider (Anthropic/OpenAI/Ollama), streaming tool execution, MCP support.",
   "type": "module",
   "main": "./dist/index.js",
