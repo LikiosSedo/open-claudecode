@@ -6,6 +6,7 @@
  */
 
 import { agentLoop, type AgentEvent } from './agent.js'
+import type { TraceCallback } from './trace.js'
 import type { Provider, Message } from './providers/types.js'
 import { AnthropicProvider } from './providers/anthropic.js'
 import { OpenAIProvider } from './providers/openai.js'
@@ -25,6 +26,8 @@ import { GrepTool } from './tools/grep.js'
 // -- Re-exports --
 
 export type { AgentEvent } from './agent.js'
+export type { TraceEvent, TraceCallback } from './trace.js'
+export { consoleTracer } from './trace.js'
 export type { Tool, ToolResult, ToolContext } from './tools/types.js'
 export type { Provider, Message } from './providers/types.js'
 
@@ -81,6 +84,8 @@ export interface AgentOptions {
   }
   /** Working directory. Default: process.cwd() */
   cwd?: string
+  /** Observability trace callback. Receives TraceEvents for LLM calls, tools, permissions, compaction. */
+  onTrace?: TraceCallback
 }
 
 // -- Agent class --
@@ -98,6 +103,7 @@ export class Agent {
   private cwd: string
   private messages: Message[] = []
   private hooks?: AgentOptions['hooks']
+  private onTrace?: TraceCallback
   private _sessionId?: string
   private _mcpConfigs?: AgentOptions['mcpServers']
   private _initialized = false
@@ -107,6 +113,7 @@ export class Agent {
     this.maxTurns = options.maxTurns ?? 30
     this.maxTokens = options.maxTokens
     this.hooks = options.hooks
+    this.onTrace = options.onTrace
     this._mcpConfigs = options.mcpServers
 
     // Resolve model: explicit > provider config > default
@@ -184,6 +191,7 @@ export class Agent {
       abortSignal: options?.abortSignal,
       toolContext: { cwd: this.cwd },
       permissionCheck,
+      onTrace: this.onTrace,
       onCompact: async (msgs, opts) => {
         const r = opts?.force
           ? await this.contextManager.forceCompact(msgs, this.provider, this.model)

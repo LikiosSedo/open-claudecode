@@ -26,6 +26,7 @@ import type {
   ToolResult,
   PermissionDecision,
 } from './tools/types.js'
+import type { TraceCallback } from './trace.js'
 import {
   normalizeMessages,
   ensureToolResultPairing,
@@ -429,6 +430,8 @@ export interface AgentLoopOptions {
     | { type: 'disabled' }
     | { type: 'adaptive' }
     | { type: 'enabled'; budgetTokens: number }
+  /** Observability trace callback. Called at LLM, tool, permission, and compaction boundaries. */
+  onTrace?: TraceCallback
 }
 
 /**
@@ -449,6 +452,7 @@ export async function* agentLoop(
     permissionCheck,
     hookManager,
     thinking,
+    onTrace,
   } = options
 
   const systemPrompt = options.systemPrompt
@@ -481,13 +485,19 @@ export async function* agentLoop(
   const MIN_CONTINUATION_TOKENS = 200
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    const turnStart = Date.now()
+    let turnToolCalls = 0
+
     // Normalize messages before every API call: fix tool pairing + enforce alternation
     const normalizedMessages = normalizeMessages(ensureToolResultPairing(messages))
 
     // Recompute schemas each turn: discover() may have added deferred tools
     const toolSchemas = tools.availableSchemas()
 
+    onTrace?.({ type: 'llm_start', turn, model })
+
     let stream: AsyncIterable<import('./providers/types.js').StreamEvent>
+    const llmStart = Date.now()
     try {
       stream = provider.stream(normalizedMessages, toolSchemas, { model, maxTokens, systemPrompt, temperature, thinking })
     } catch (err) {
@@ -514,6 +524,7 @@ export async function* agentLoop(
     let hasToolUse = false
     // New executor per turn (Claude Code: query.ts:562)
     const executor = new StreamingToolExecutor(tools, toolContext, abortSignal)
+    const toolStartTimes = new Map<string, number>()
 
     // Reactive compact: prompt-too-long errors surface during stream iteration
     // (the API rejects with 400/413 on first chunk fetch). Catch, compact, retry.
@@ -610,7 +621,10 @@ export async function* agentLoop(
 
           // Permission check before execution (async — may prompt user)
           if (permissionCheck) {
+            const permStart = Date.now()
             const decision = await permissionCheck(toolName, input)
+            const permDecision = decision.behavior === 'deny' ? 'deny' as const : 'allow' as const
+            onTrace?.({ type: 'permission', turn, tool: toolName, decision: permDecision, durationMs: Date.now() - permStart })
             if (decision.behavior === 'deny') {
               // Feed a pre-denied result into executor
               executor.addDeniedTool(event.id, toolName, `Permission denied: ${decision.reason}`)
@@ -620,6 +634,9 @@ export async function* agentLoop(
             // 'allow' falls through to normal execution
           }
 
+          turnToolCalls++
+          toolStartTimes.set(event.id, Date.now())
+          onTrace?.({ type: 'tool_start', turn, name: toolName, id: event.id, input })
           executor.addTool(event.id, toolName, input)
           yield { type: 'tool_start', name: toolName, id: event.id }
           break
@@ -668,6 +685,8 @@ export async function* agentLoop(
 
     if (streamErrored) continue // retry the turn after reactive compact
 
+    onTrace?.({ type: 'llm_end', turn, durationMs: Date.now() - llmStart, usage: turnUsage, stopReason })
+
     // Flush trailing text/thinking
     if (currentText) {
       contentBlocks.push({ type: 'text', text: currentText })
@@ -707,6 +726,9 @@ export async function* agentLoop(
           isError: event.isError,
         }
 
+        const toolElapsed = Date.now() - (toolStartTimes.get(event.id) ?? Date.now())
+        onTrace?.({ type: 'tool_end', turn, name: event.name, id: event.id, durationMs: toolElapsed, isError: event.isError, outputSize: event.result.length })
+
         // PostToolUse hooks: fire-and-forget observation after each tool result
         if (hookManager) {
           await hookManager.execute('PostToolUse', {
@@ -740,6 +762,7 @@ export async function* agentLoop(
     totalUsage = addUsage(totalUsage, turnUsage)
     reactiveCompactAttempts = 0 // reset on successful turn
     streamRetryAttempted = false // reset retry flag on successful turn
+    onTrace?.({ type: 'turn_summary', turn, toolCalls: turnToolCalls, stopReason, usage: turnUsage, durationMs: Date.now() - turnStart })
     yield { type: 'turn_complete', stopReason, usage: turnUsage }
 
     // -- 4. Check if we should continue --
@@ -777,10 +800,12 @@ export async function* agentLoop(
 
     // -- 5. Context compaction hook (cf. Claude Code autocompact) --
     if (options.onCompact) {
+      const beforeCount = messages.length
       const compacted = await options.onCompact(messages)
       if (compacted !== messages) {
         messages.length = 0
         messages.push(...compacted)
+        onTrace?.({ type: 'compact', turn, beforeMessages: beforeCount, afterMessages: messages.length })
       }
     }
   }
