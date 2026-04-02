@@ -133,8 +133,8 @@ export class Agent {
       ? [options.systemPrompt]
       : buildSystemPrompt({ cwd: this.cwd })
 
-    // Context + session managers
-    this.contextManager = new ContextManager(options.context)
+    // Context + session managers (model-aware: auto-sets window from model name)
+    this.contextManager = new ContextManager({ ...options.context, model: this.model })
     if (options.session) {
       const dir = typeof options.session === 'object' ? options.session.dir : undefined
       this.sessionManager = new SessionManager(dir ? { sessionDir: dir } : undefined)

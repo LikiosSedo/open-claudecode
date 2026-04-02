@@ -388,6 +388,19 @@ function addUsage(a: TokenUsage, b?: TokenUsage): TokenUsage {
 
 const EMPTY_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
 
+// -- Tool Result Budgeting (cf. Claude Code DEFAULT_MAX_RESULT_SIZE_CHARS in toolLimits.ts) --
+const TOOL_RESULT_MAX_CHARS = 50_000
+
+/**
+ * Truncate tool result content that exceeds the per-result budget.
+ * Keeps the first portion and appends a truncation notice with original size.
+ */
+function applyToolResultBudget(content: string): string {
+  if (content.length <= TOOL_RESULT_MAX_CHARS) return content
+  const truncated = content.slice(0, TOOL_RESULT_MAX_CHARS)
+  return `${truncated}\n\n[Truncated: original was ${content.length} chars, showing first ${TOOL_RESULT_MAX_CHARS}]`
+}
+
 export interface AgentLoopOptions {
   provider: Provider
   tools: ToolRegistry
@@ -460,6 +473,7 @@ export async function* agentLoop(
   let totalUsage: TokenUsage = { ...EMPTY_USAGE }
   let reactiveCompactAttempts = 0
   const MAX_REACTIVE_COMPACT_ATTEMPTS = 2
+  let streamRetryAttempted = false // one-shot retry on general stream errors
 
   // Continuation diminishing returns tracking (cf. Claude Code tokenBudget.ts)
   let continuationCount = 0
@@ -630,6 +644,12 @@ export async function* agentLoop(
         messages.push(...compacted)
         streamErrored = true
         // Fall through to continue — don't process the failed turn's results
+      } else if (!streamRetryAttempted) {
+        // General streaming fallback: discard partial content, abort executor, retry once.
+        // cf. Claude Code query.ts withheld error / recovery pattern
+        streamRetryAttempted = true
+        executor.abort()
+        streamErrored = true
       } else {
         throw streamErr
       }
@@ -685,10 +705,13 @@ export async function* agentLoop(
           })
         }
 
+        // Cap tool result size before adding to messages (cf. Claude Code applyToolResultBudget)
+        const budgetedResult = applyToolResultBudget(event.result)
+
         toolResultContents.push({
           type: 'tool_result',
           toolUseId: event.id,
-          content: event.result,
+          content: budgetedResult,
           isError: event.isError || undefined,
         })
       }
@@ -705,6 +728,7 @@ export async function* agentLoop(
 
     totalUsage = addUsage(totalUsage, turnUsage)
     reactiveCompactAttempts = 0 // reset on successful turn
+    streamRetryAttempted = false // reset retry flag on successful turn
     yield { type: 'turn_complete', stopReason, usage: turnUsage }
 
     // -- 4. Check if we should continue --

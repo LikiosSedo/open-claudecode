@@ -93,3 +93,69 @@ export interface Provider {
   /** Estimate token count for messages (for context management) */
   estimateTokens(messages: Message[]): number
 }
+
+// --- Tool-use graceful degradation helpers ---
+
+/**
+ * Build a text description of tools for injection into system prompt
+ * when the model doesn't support native function calling.
+ */
+export function buildToolPrompt(tools: ToolSchema[]): string {
+  if (tools.length === 0) return ''
+  const descriptions = tools.map(t =>
+    `- ${t.name}: ${t.description}\n  Input schema: ${JSON.stringify(t.inputSchema)}`
+  ).join('\n')
+  return [
+    'You have access to the following tools. To call a tool, output EXACTLY this format (one per call):',
+    '<tool_call>{"name": "tool_name", "input": {...}}</tool_call>',
+    '',
+    'Available tools:',
+    descriptions,
+  ].join('\n')
+}
+
+/**
+ * Parse text-based tool calls from model output.
+ * Models without native function calling are instructed to output:
+ *   <tool_call>{"name":"...", "input":{...}}</tool_call>
+ *
+ * Returns the text with tool_call tags removed, plus parsed tool calls.
+ */
+export function parseTextToolCalls(text: string): {
+  cleanText: string
+  toolCalls: Array<{ name: string; input: Record<string, unknown> }>
+} {
+  const toolCalls: Array<{ name: string; input: Record<string, unknown> }> = []
+  const cleanText = text.replace(
+    /<tool_call>([\s\S]*?)<\/tool_call>/g,
+    (_match, json: string) => {
+      try {
+        const parsed = JSON.parse(json.trim())
+        if (parsed.name && typeof parsed.name === 'string') {
+          toolCalls.push({
+            name: parsed.name,
+            input: parsed.input ?? {},
+          })
+        }
+      } catch {
+        // Malformed tool call — leave in text so user/agent can see it
+        return _match
+      }
+      return ''
+    },
+  )
+  return { cleanText: cleanText.trim(), toolCalls }
+}
+
+/**
+ * Detect if an API error indicates the model doesn't support tool_use.
+ */
+export function isToolsNotSupportedError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+  const status = 'status' in err ? (err as { status: number }).status : 0
+  if (status !== 400 && status !== 404) return false
+  const message = 'message' in err ? String((err as { message: string }).message) : ''
+  const body = 'body' in err ? JSON.stringify((err as { body: unknown }).body) : ''
+  const combined = (message + ' ' + body).toLowerCase()
+  return combined.includes('tools') || combined.includes('function') || combined.includes('not supported')
+}

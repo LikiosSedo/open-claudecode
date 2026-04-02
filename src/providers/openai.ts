@@ -10,6 +10,7 @@ import type {
   Provider, ProviderOptions, Message, ToolSchema,
   StreamEvent, StopReason,
 } from './types.js'
+import { buildToolPrompt, parseTextToolCalls, isToolsNotSupportedError } from './types.js'
 import { isRetryableError, getBackoffDelay, MAX_RETRIES } from './retry.js'
 
 export class OpenAIProvider implements Provider {
@@ -29,8 +30,6 @@ export class OpenAIProvider implements Provider {
     tools: ToolSchema[],
     options: ProviderOptions,
   ): AsyncIterable<StreamEvent> {
-    const openaiMessages = this.convertMessages(messages, options.systemPrompt)
-
     const openaiTools: OpenAI.ChatCompletionTool[] = tools.map(t => ({
       type: 'function',
       function: {
@@ -40,7 +39,34 @@ export class OpenAIProvider implements Provider {
       },
     }))
 
-    // Retry loop: retry on transient errors before consuming the stream
+    // Track whether native tools are supported by this model
+    let toolsSupported = true
+
+    // Build params (reused for streaming, non-streaming, and tool-less retries)
+    const buildParams = (useTools: boolean) => {
+      const systemPrompt = useTools
+        ? options.systemPrompt
+        : this.injectToolPrompt(options.systemPrompt, tools)
+      const openaiMessages = this.convertMessages(messages, systemPrompt)
+      return {
+        model: options.model,
+        max_tokens: options.maxTokens ?? 16384,
+        messages: openaiMessages,
+        tools: useTools && openaiTools.length > 0 ? openaiTools : undefined,
+        ...(options.outputSchema ? {
+          response_format: {
+            type: 'json_schema' as const,
+            json_schema: {
+              name: options.outputSchema.name,
+              schema: options.outputSchema.schema,
+              strict: true,
+            },
+          },
+        } : {}),
+      }
+    }
+
+    // Retry loop
     let lastError: unknown
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
@@ -49,103 +75,204 @@ export class OpenAIProvider implements Provider {
         await new Promise(r => setTimeout(r, delay))
       }
 
+      const params = buildParams(toolsSupported)
+
       let stream
       try {
         stream = await this.client.chat.completions.create({
-          model: options.model,
-          max_tokens: options.maxTokens ?? 16384,
-          messages: openaiMessages,
-          tools: openaiTools.length > 0 ? openaiTools : undefined,
+          ...params,
           stream: true,
           stream_options: { include_usage: true },
-          ...(options.outputSchema ? {
-            response_format: {
-              type: 'json_schema' as const,
-              json_schema: {
-                name: options.outputSchema.name,
-                schema: options.outputSchema.schema,
-                strict: true,
-              },
-            },
-          } : {}),
         })
       } catch (err) {
+        // Detect models that don't support function calling
+        if (isToolsNotSupportedError(err) && toolsSupported && tools.length > 0) {
+          console.error(`[${this.name}] Model does not support tools — falling back to prompt-based tool calling`)
+          toolsSupported = false
+          lastError = err
+          continue
+        }
         lastError = err
-        if (!isRetryableError(err) || attempt >= MAX_RETRIES) throw err
+        if (!isRetryableError(err) || attempt >= MAX_RETRIES) {
+          yield* this.nonStreamingFallback(params, toolsSupported, tools)
+          return
+        }
         continue
       }
 
-      // Track tool call accumulation (OpenAI streams tool calls differently)
-      const toolCalls = new Map<number, { id: string; name: string; args: string }>()
-      let lastToolIndex = -1
-
-      yield { type: 'message_start', messageId: '' }
-
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta
-        if (!delta) continue
-
-        // Text content
-        if (delta.content) {
-          yield { type: 'text_delta', text: delta.content }
+      // Consume the stream
+      try {
+        yield* this.consumeStream(stream, toolsSupported, tools)
+        return
+      } catch (streamErr) {
+        lastError = streamErr
+        if (!isRetryableError(streamErr) || attempt >= MAX_RETRIES) {
+          console.error(`[${this.name}] Stream failed, falling back to non-streaming`)
+          yield* this.nonStreamingFallback(params, toolsSupported, tools)
+          return
         }
+      }
+    }
+  }
 
-        // Tool calls
-        if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index
+  /**
+   * Consume an OpenAI streaming response and yield normalized StreamEvents.
+   */
+  private async *consumeStream(
+    stream: AsyncIterable<OpenAI.ChatCompletionChunk>,
+    toolsSupported: boolean,
+    tools: ToolSchema[],
+  ): AsyncIterable<StreamEvent> {
+    const toolCalls = new Map<number, { id: string; name: string; args: string }>()
+    let lastToolIndex = -1
+    let fullText = ''
 
-            // When a new tool_call starts, stop the previous one
-            if (!toolCalls.has(idx) && idx > lastToolIndex && lastToolIndex >= 0) {
-              const prev = toolCalls.get(lastToolIndex)
-              if (prev) {
-                let input: unknown
-                try { input = JSON.parse(prev.args || '{}') } catch { input = {} }
-                yield { type: 'tool_use_stop', id: prev.id, input }
-              }
-            }
+    yield { type: 'message_start', messageId: '' }
 
-            if (!toolCalls.has(idx)) {
-              const id = tc.id ?? `call_${idx}`
-              const name = tc.function?.name ?? ''
-              toolCalls.set(idx, { id, name, args: '' })
-              lastToolIndex = idx
-              yield { type: 'tool_use_start', id, name }
-            }
-            const tracked = toolCalls.get(idx)!
-            if (tc.function?.arguments) {
-              tracked.args += tc.function.arguments
-              yield { type: 'tool_use_delta', id: tracked.id, partialJson: tc.function.arguments }
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta
+      if (!delta) continue
+
+      if (delta.content) {
+        fullText += delta.content
+        yield { type: 'text_delta', text: delta.content }
+      }
+
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index
+          if (!toolCalls.has(idx) && idx > lastToolIndex && lastToolIndex >= 0) {
+            const prev = toolCalls.get(lastToolIndex)
+            if (prev) {
+              let input: unknown
+              try { input = JSON.parse(prev.args || '{}') } catch { input = {} }
+              yield { type: 'tool_use_stop', id: prev.id, input }
             }
           }
-        }
-
-        // Finish
-        const finishReason = chunk.choices[0]?.finish_reason
-        if (finishReason) {
-          // Emit tool_use_stop for the last tracked tool (if any)
-          if (lastToolIndex >= 0 && toolCalls.has(lastToolIndex)) {
-            const last = toolCalls.get(lastToolIndex)!
-            let input: unknown
-            try { input = JSON.parse(last.args || '{}') } catch { input = {} }
-            yield { type: 'tool_use_stop', id: last.id, input }
-            toolCalls.delete(lastToolIndex)  // Prevent duplicate stop if already emitted by next-tool-start
+          if (!toolCalls.has(idx)) {
+            const id = tc.id ?? `call_${idx}`
+            const name = tc.function?.name ?? ''
+            toolCalls.set(idx, { id, name, args: '' })
+            lastToolIndex = idx
+            yield { type: 'tool_use_start', id, name }
           }
-
-          const usage = chunk.usage
-          yield {
-            type: 'message_stop',
-            stopReason: this.mapFinishReason(finishReason),
-            usage: usage ? {
-              inputTokens: usage.prompt_tokens,
-              outputTokens: usage.completion_tokens,
-            } : undefined,
+          const tracked = toolCalls.get(idx)!
+          if (tc.function?.arguments) {
+            tracked.args += tc.function.arguments
+            yield { type: 'tool_use_delta', id: tracked.id, partialJson: tc.function.arguments }
           }
         }
       }
 
-      return  // Stream consumed successfully, exit retry loop
+      const finishReason = chunk.choices[0]?.finish_reason
+      if (finishReason) {
+        if (lastToolIndex >= 0 && toolCalls.has(lastToolIndex)) {
+          const last = toolCalls.get(lastToolIndex)!
+          let input: unknown
+          try { input = JSON.parse(last.args || '{}') } catch { input = {} }
+          yield { type: 'tool_use_stop', id: last.id, input }
+          toolCalls.delete(lastToolIndex)
+        }
+
+        // Parse text-based tool calls if native tools not supported
+        if (!toolsSupported && tools.length > 0) {
+          yield* this.emitTextToolCalls(fullText)
+        }
+
+        const usage = chunk.usage
+        yield {
+          type: 'message_stop',
+          stopReason: this.mapFinishReason(finishReason),
+          usage: usage ? {
+            inputTokens: usage.prompt_tokens,
+            outputTokens: usage.completion_tokens,
+          } : undefined,
+        }
+      }
     }
+  }
+
+  /**
+   * Non-streaming fallback: called after streaming retries are exhausted.
+   */
+  private async *nonStreamingFallback(
+    params: Record<string, unknown>,
+    toolsSupported: boolean,
+    tools: ToolSchema[],
+  ): AsyncIterable<StreamEvent> {
+    console.error(`[${this.name}] Attempting non-streaming fallback`)
+    const response = await this.client.chat.completions.create({
+      ...params,
+      stream: false,
+    } as OpenAI.ChatCompletionCreateParamsNonStreaming) as OpenAI.ChatCompletion
+
+    yield { type: 'message_start', messageId: response.id }
+
+    const choice = response.choices[0]
+    if (!choice) {
+      yield { type: 'message_stop', stopReason: 'end_turn' }
+      return
+    }
+
+    // Emit text content
+    let fullText = ''
+    if (choice.message.content) {
+      fullText = choice.message.content
+      yield { type: 'text_delta', text: choice.message.content }
+    }
+
+    // Emit native tool calls
+    if (choice.message.tool_calls) {
+      for (const tc of choice.message.tool_calls) {
+        const id = tc.id
+        const name = tc.function.name
+        let input: unknown
+        try { input = JSON.parse(tc.function.arguments || '{}') } catch { input = {} }
+        yield { type: 'tool_use_start', id, name }
+        yield { type: 'tool_use_stop', id, input }
+      }
+    }
+
+    // Parse text-based tool calls if native tools not supported
+    if (!toolsSupported && tools.length > 0) {
+      yield* this.emitTextToolCalls(fullText)
+    }
+
+    yield {
+      type: 'message_stop',
+      stopReason: this.mapFinishReason(choice.finish_reason ?? 'stop'),
+      usage: response.usage ? {
+        inputTokens: response.usage.prompt_tokens,
+        outputTokens: response.usage.completion_tokens,
+      } : undefined,
+    }
+  }
+
+  /**
+   * Parse <tool_call> tags from model text and emit tool_use events.
+   */
+  private *emitTextToolCalls(text: string): Iterable<StreamEvent> {
+    const { toolCalls } = parseTextToolCalls(text)
+    for (let i = 0; i < toolCalls.length; i++) {
+      const tc = toolCalls[i]
+      const id = `text_tool_${Date.now()}_${i}`
+      yield { type: 'tool_use_start', id, name: tc.name }
+      yield { type: 'tool_use_stop', id, input: tc.input }
+    }
+  }
+
+  /**
+   * Inject tool descriptions into system prompt for models without function calling.
+   */
+  private injectToolPrompt(
+    systemPrompt: string | string[] | undefined,
+    tools: ToolSchema[],
+  ): string | string[] | undefined {
+    const toolPrompt = buildToolPrompt(tools)
+    if (!toolPrompt) return systemPrompt
+    if (!systemPrompt) return toolPrompt
+    if (Array.isArray(systemPrompt)) return [...systemPrompt, toolPrompt]
+    return systemPrompt + '\n\n' + toolPrompt
   }
 
   estimateTokens(messages: Message[]): number {

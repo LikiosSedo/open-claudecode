@@ -10,6 +10,50 @@
 
 import type { Message, Provider } from './providers/types.js'
 
+// -- Model-aware context window sizing --
+
+/** Known context window sizes by model prefix (longest prefix wins). */
+const MODEL_CONTEXT_WINDOWS: [prefix: string, tokens: number][] = [
+  // Claude — 200K default
+  ['claude-', 200_000],
+  // OpenAI
+  ['gpt-4o', 128_000],
+  ['gpt-4-turbo', 128_000],
+  ['gpt-4', 8_192],
+  ['gpt-3.5-turbo', 16_385],
+  ['o1', 200_000],
+  ['o3', 200_000],
+  ['o4-mini', 200_000],
+  // Gemini
+  ['gemini-2', 1_000_000],
+  ['gemini-1.5', 1_000_000],
+  ['gemini-', 32_000],
+  // DeepSeek
+  ['deepseek-', 64_000],
+  // Ollama / local (conservative defaults)
+  ['llama3', 8_192],
+  ['llama-3', 8_192],
+  ['qwen2', 32_000],
+  ['qwen-', 32_000],
+  ['mistral', 32_000],
+  ['phi-', 16_000],
+  ['codellama', 16_000],
+]
+
+const DEFAULT_CONTEXT_WINDOW = 128_000
+
+/**
+ * Resolve context window size for a model.
+ * Matches the longest prefix in MODEL_CONTEXT_WINDOWS, falls back to 128K.
+ */
+export function getContextWindowSize(model: string): number {
+  const lower = model.toLowerCase()
+  for (const [prefix, tokens] of MODEL_CONTEXT_WINDOWS) {
+    if (lower.startsWith(prefix)) return tokens
+  }
+  return DEFAULT_CONTEXT_WINDOW
+}
+
 // Compact prompt — from Claude Code src/services/compact/prompt.ts
 const COMPACT_PROMPT = `Create a detailed summary of the conversation so far. This summary replaces the original messages, so capture everything needed to continue the work.
 
@@ -72,11 +116,14 @@ export class ContextManager {
   private consecutiveFailures = 0
 
   constructor(options?: {
-    maxTokens?: number              // default 200_000 (Claude's context window)
+    maxTokens?: number              // explicit override — highest priority
+    model?: string                  // auto-detect from model name
     reservedOutputTokens?: number   // default 20_000
     compactThreshold?: number       // default 0.85
   }) {
-    this.maxTokens = options?.maxTokens ?? 200_000
+    // Priority: explicit maxTokens > model-based lookup > 128K default
+    this.maxTokens = options?.maxTokens
+      ?? (options?.model ? getContextWindowSize(options.model) : DEFAULT_CONTEXT_WINDOW)
     this.reservedOutputTokens = options?.reservedOutputTokens ?? 20_000
     this.compactThreshold = options?.compactThreshold ?? 0.85
   }

@@ -315,7 +315,7 @@ async function main() {
   let thinkingConfig: ThinkingConfig = parseThinkingConfig(process.env.OCC_THINKING)
   const cwd = process.cwd()
   const tools = createToolRegistry()
-  const contextManager = new ContextManager()
+  const contextManager = new ContextManager({ model })
 
   // --- Permission Mode ---
   const args = process.argv.slice(2)
