@@ -92,6 +92,13 @@ export interface AgentOptions {
 
 // -- Agent class --
 
+/**
+ * Event handler types for reactive agents.
+ * - Full control: `on('event', async (data, agent) => { for await (const e of agent.run(...)) ... })`
+ * - Auto-trigger: `onTrigger('event', (data) => \`prompt: ${data}\`)`
+ */
+export type AgentEventHandler = (data: unknown, agent: Agent) => void | Promise<void>
+
 export class Agent {
   private provider: Provider
   private tools: ToolRegistry
@@ -110,6 +117,7 @@ export class Agent {
   private _sessionId?: string
   private _mcpConfigs?: AgentOptions['mcpServers']
   private _initialized = false
+  private _eventHandlers = new Map<string, AgentEventHandler[]>()
 
   constructor(options: AgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd()
@@ -258,6 +266,67 @@ export class Agent {
   /** Get current session ID */
   getSessionId(): string | undefined {
     return this._sessionId
+  }
+
+  // -- Event system: reactive agent support --
+
+  /** Register handler for a custom event. Handler receives event data + this agent. */
+  on(event: string, handler: AgentEventHandler): this {
+    const handlers = this._eventHandlers.get(event) ?? []
+    handlers.push(handler)
+    this._eventHandlers.set(event, handlers)
+    return this
+  }
+
+  /** Remove a specific handler. */
+  off(event: string, handler: AgentEventHandler): this {
+    const handlers = this._eventHandlers.get(event)
+    if (handlers) {
+      const idx = handlers.indexOf(handler)
+      if (idx >= 0) handlers.splice(idx, 1)
+    }
+    return this
+  }
+
+  /**
+   * Convenience: auto-run agent when event fires.
+   * The promptFn converts event data into a prompt string.
+   * Returns an async generator of AgentEvents from the triggered run.
+   *
+   * Usage:
+   *   agent.onTrigger('alert', (data) => `Investigate: ${data.message}`)
+   *   const events = agent.emit('alert', { message: 'Pod crashing' })
+   *   for await (const e of events) { ... }
+   */
+  onTrigger(event: string, promptFn: (data: unknown) => string): this {
+    this.on(event, async (data, agent) => {
+      // Auto-trigger run is fire-and-forget from handler perspective.
+      // To consume events, use emit() which returns the generator.
+    })
+    // Store promptFn separately for emit() to use
+    const key = `__trigger__${event}`
+    ;(this as Record<string, unknown>)[key] = promptFn
+    return this
+  }
+
+  /**
+   * Emit an event. Calls all registered handlers, then if an onTrigger
+   * exists for this event, returns an async generator from agent.run().
+   */
+  async *emit(event: string, data?: unknown): AsyncGenerator<AgentEvent> {
+    // Fire regular handlers (fire-and-forget)
+    const handlers = this._eventHandlers.get(event) ?? []
+    for (const handler of handlers) {
+      await handler(data, this)
+    }
+
+    // Check for onTrigger auto-run
+    const triggerKey = `__trigger__${event}`
+    const promptFn = (this as Record<string, unknown>)[triggerKey] as ((data: unknown) => string) | undefined
+    if (promptFn) {
+      const prompt = promptFn(data)
+      yield* this.run(prompt)
+    }
   }
 }
 
