@@ -86,6 +86,8 @@ export interface AgentOptions {
   cwd?: string
   /** Observability trace callback. Receives TraceEvents for LLM calls, tools, permissions, compaction. */
   onTrace?: TraceCallback
+  /** Plan-before-execute: first turn outputs a plan (no tools), then executes. */
+  planFirst?: boolean
 }
 
 // -- Agent class --
@@ -104,6 +106,7 @@ export class Agent {
   private messages: Message[] = []
   private hooks?: AgentOptions['hooks']
   private onTrace?: TraceCallback
+  private planFirst: boolean
   private _sessionId?: string
   private _mcpConfigs?: AgentOptions['mcpServers']
   private _initialized = false
@@ -114,6 +117,7 @@ export class Agent {
     this.maxTokens = options.maxTokens
     this.hooks = options.hooks
     this.onTrace = options.onTrace
+    this.planFirst = options.planFirst ?? false
     this._mcpConfigs = options.mcpServers
 
     // Resolve model: explicit > provider config > default
@@ -192,6 +196,7 @@ export class Agent {
       toolContext: { cwd: this.cwd },
       permissionCheck,
       onTrace: this.onTrace,
+      planFirst: this.planFirst,
       onCompact: async (msgs, opts) => {
         const r = opts?.force
           ? await this.contextManager.forceCompact(msgs, this.provider, this.model)

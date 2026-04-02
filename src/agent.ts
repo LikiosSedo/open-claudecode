@@ -43,6 +43,7 @@ export type AgentEvent =
   | { type: 'tool_start'; name: string; id: string }
   | { type: 'tool_progress'; name: string; id: string; output: string }
   | { type: 'tool_result'; name: string; id: string; result: string; isError: boolean }
+  | { type: 'plan_complete'; plan: string }
   | { type: 'turn_complete'; stopReason: StopReason; usage: TokenUsage }
   | { type: 'message_complete'; messages: Message[]; totalUsage: TokenUsage }
 
@@ -432,6 +433,13 @@ export interface AgentLoopOptions {
     | { type: 'enabled'; budgetTokens: number }
   /** Observability trace callback. Called at LLM, tool, permission, and compaction boundaries. */
   onTrace?: TraceCallback
+  /**
+   * Plan-before-execute mode. When enabled, the first turn forces the model to
+   * output a step-by-step plan (no tool calls). A 'plan_complete' event is yielded
+   * with the plan text, then "Proceed with the plan." is injected to start execution.
+   * Inspired by CrewAI's planning pattern + Claude Code's Plan mode.
+   */
+  planFirst?: boolean
 }
 
 /**
@@ -478,11 +486,24 @@ export async function* agentLoop(
   let reactiveCompactAttempts = 0
   const MAX_REACTIVE_COMPACT_ATTEMPTS = 2
   let streamRetryAttempted = false // one-shot retry on general stream errors
+  let planningDone = !options.planFirst // skip planning phase if not enabled
 
   // Continuation diminishing returns tracking (cf. Claude Code tokenBudget.ts)
   let continuationCount = 0
   const MAX_CONTINUATIONS = 5
   const MIN_CONTINUATION_TOKENS = 200
+
+  // Planning phase: inject instruction into the last user message to force plan output
+  if (options.planFirst && messages.length > 0) {
+    const lastMsg = messages[messages.length - 1]
+    if (lastMsg?.role === 'user') {
+      const textBlocks = lastMsg.content.filter(b => b.type === 'text')
+      if (textBlocks.length > 0) {
+        const lastText = textBlocks[textBlocks.length - 1] as { type: 'text'; text: string }
+        lastText.text += '\n\nIMPORTANT: Before taking any action, first output a detailed step-by-step plan. Do NOT call any tools yet. Just describe what you will do and why.'
+      }
+    }
+  }
 
   for (let turn = 0; turn < maxTurns; turn++) {
     const turnStart = Date.now()
@@ -492,7 +513,8 @@ export async function* agentLoop(
     const normalizedMessages = normalizeMessages(ensureToolResultPairing(messages))
 
     // Recompute schemas each turn: discover() may have added deferred tools
-    const toolSchemas = tools.availableSchemas()
+    // Planning turn: send empty tools to prevent tool calls (model plans in text only)
+    const toolSchemas = !planningDone ? [] : tools.availableSchemas()
 
     onTrace?.({ type: 'llm_start', turn, model })
 
@@ -764,6 +786,23 @@ export async function* agentLoop(
     streamRetryAttempted = false // reset retry flag on successful turn
     onTrace?.({ type: 'turn_summary', turn, toolCalls: turnToolCalls, stopReason, usage: turnUsage, durationMs: Date.now() - turnStart })
     yield { type: 'turn_complete', stopReason, usage: turnUsage }
+
+    // -- Plan-before-execute: after planning turn, yield plan and inject "proceed"
+    if (!planningDone) {
+      // Collect plan text from the assistant message we just built
+      const planText = contentBlocks
+        .filter(b => b.type === 'text')
+        .map(b => (b as { text: string }).text)
+        .join('\n')
+      yield { type: 'plan_complete', plan: planText }
+      // Inject continuation message to start execution
+      messages.push({
+        role: 'user',
+        content: [{ type: 'text', text: 'Good plan. Now execute it step by step. Use tools as needed.' }],
+      })
+      planningDone = true
+      continue // next turn will have tools enabled
+    }
 
     // -- 4. Check if we should continue --
     if (abortSignal?.aborted) {
