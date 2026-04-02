@@ -34,6 +34,7 @@ import {
 } from './messages.js'
 import type { HookManager } from './hooks.js'
 import { FileReadCache } from './file-cache.js'
+import { RateLimiter } from './providers/retry.js'
 
 // -- AgentEvent: unified event stream yielded by agentLoop() --
 
@@ -433,6 +434,8 @@ export interface AgentLoopOptions {
     | { type: 'enabled'; budgetTokens: number }
   /** Observability trace callback. Called at LLM, tool, permission, and compaction boundaries. */
   onTrace?: TraceCallback
+  /** Minimum interval between API calls in ms. Prevents rate limit / circuit breaker on 3rd-party APIs. Default: 0 (no throttle). */
+  apiThrottleMs?: number
   /**
    * Plan-before-execute mode. When enabled, the first turn forces the model to
    * output a step-by-step plan (no tool calls). A 'plan_complete' event is yielded
@@ -486,6 +489,7 @@ export async function* agentLoop(
   let reactiveCompactAttempts = 0
   const MAX_REACTIVE_COMPACT_ATTEMPTS = 2
   let streamRetryAttempted = false // one-shot retry on general stream errors
+  const rateLimiter = options.apiThrottleMs ? new RateLimiter(options.apiThrottleMs) : null
   let planningDone = !options.planFirst // skip planning phase if not enabled
 
   // Continuation diminishing returns tracking (cf. Claude Code tokenBudget.ts)
@@ -517,6 +521,9 @@ export async function* agentLoop(
     const toolSchemas = !planningDone ? [] : tools.availableSchemas()
 
     onTrace?.({ type: 'llm_start', turn, model })
+
+    // Rate limit: ensure minimum interval between API calls (prevents 3rd-party circuit breakers)
+    if (rateLimiter) await rateLimiter.throttle()
 
     let stream: AsyncIterable<import('./providers/types.js').StreamEvent>
     const llmStart = Date.now()

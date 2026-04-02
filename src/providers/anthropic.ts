@@ -13,7 +13,7 @@ import type {
   StreamEvent, TokenUsage, StopReason,
 } from './types.js'
 import { buildToolPrompt, parseTextToolCalls, isToolsNotSupportedError } from './types.js'
-import { isRetryableError, getBackoffDelay, MAX_RETRIES } from './retry.js'
+import { isRetryableError, isCircuitBreakerError, getCircuitBreakerWaitMs, getBackoffDelay, MAX_RETRIES } from './retry.js'
 
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic'
@@ -115,6 +115,12 @@ export class AnthropicProvider implements Provider {
           continue
         }
         lastError = err
+        if (isCircuitBreakerError(err)) {
+          // Circuit breaker: stop everything, wait, then throw (don't hammer)
+          console.error(`[anthropic] Circuit breaker detected, waiting ${getCircuitBreakerWaitMs() / 1000}s`)
+          await new Promise(r => setTimeout(r, getCircuitBreakerWaitMs()))
+          throw err
+        }
         if (!isRetryableError(err) || attempt >= MAX_RETRIES) {
           // All streaming retries exhausted — try non-streaming fallback
           yield* this.nonStreamingFallback(params, toolsSupported, tools)

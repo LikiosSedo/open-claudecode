@@ -90,6 +90,8 @@ export interface AgentOptions {
   onTrace?: TraceCallback
   /** Plan-before-execute: first turn outputs a plan (no tools), then executes. */
   planFirst?: boolean
+  /** Minimum ms between API calls. Prevents rate limit on 3rd-party APIs. Default: 0. */
+  apiThrottleMs?: number
 }
 
 // -- Agent class --
@@ -116,6 +118,7 @@ export class Agent {
   private hooks?: AgentOptions['hooks']
   private onTrace?: TraceCallback
   private planFirst: boolean
+  private apiThrottleMs: number
   private _sessionId?: string
   private _mcpConfigs?: AgentOptions['mcpServers']
   private _initialized = false
@@ -128,6 +131,7 @@ export class Agent {
     this.hooks = options.hooks
     this.onTrace = options.onTrace
     this.planFirst = options.planFirst ?? false
+    this.apiThrottleMs = options.apiThrottleMs ?? 0
     this._mcpConfigs = options.mcpServers
 
     // Resolve model: explicit > provider config > default
@@ -207,6 +211,7 @@ export class Agent {
       permissionCheck,
       onTrace: this.onTrace,
       planFirst: this.planFirst,
+      apiThrottleMs: this.apiThrottleMs,
       onCompact: async (msgs, opts) => {
         const r = opts?.force
           ? await this.contextManager.forceCompact(msgs, this.provider, this.model)

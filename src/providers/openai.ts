@@ -11,7 +11,7 @@ import type {
   StreamEvent, StopReason,
 } from './types.js'
 import { buildToolPrompt, parseTextToolCalls, isToolsNotSupportedError } from './types.js'
-import { isRetryableError, getBackoffDelay, MAX_RETRIES } from './retry.js'
+import { isRetryableError, isCircuitBreakerError, getCircuitBreakerWaitMs, getBackoffDelay, MAX_RETRIES } from './retry.js'
 
 export class OpenAIProvider implements Provider {
   readonly name: string
@@ -93,6 +93,11 @@ export class OpenAIProvider implements Provider {
           continue
         }
         lastError = err
+        if (isCircuitBreakerError(err)) {
+          console.error(`[${this.name}] Circuit breaker detected, waiting ${getCircuitBreakerWaitMs() / 1000}s`)
+          await new Promise(r => setTimeout(r, getCircuitBreakerWaitMs()))
+          throw err
+        }
         if (!isRetryableError(err) || attempt >= MAX_RETRIES) {
           yield* this.nonStreamingFallback(params, toolsSupported, tools)
           return
