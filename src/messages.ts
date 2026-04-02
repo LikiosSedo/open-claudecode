@@ -188,7 +188,7 @@ export function normalizeMessages(messages: Message[]): Message[] {
         ]
       }
     } else {
-      merged.push({ ...msg, content: [...msg.content] })
+      merged.push({ ...msg, content: [...msg.content] } as Message)
     }
   }
 

@@ -41,17 +41,27 @@ Core tools are sent immediately. MCP and workflow tools are deferred — discove
 ## Quick Start
 
 ```bash
-git clone https://github.com/LikiosSedo/open-claude-code.git
+npm install -g open-claudecode
+occ
+```
+
+Or install from source:
+
+```bash
+git clone https://github.com/LikiosSedo/open-claudecode.git
 cd open-claude-code
 npm install
 
-# Set your API key (pick one)
+# Run
+npm start
+```
+
+Set your API key:
+
+```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 # or
 export OPENAI_API_KEY=sk-...
-
-# Run
-npm start
 ```
 
 ### Optional Configuration
@@ -66,9 +76,26 @@ export OPENAI_API_KEY=ollama
 export OCC_MODEL=llama3
 
 # Permission modes
-npx tsx src/index.ts --bypass-permissions   # auto-approve everything
-npx tsx src/index.ts --ask-permissions      # confirm every write operation
+occ --bypass-permissions   # auto-approve everything
+occ --ask-permissions      # confirm every write operation
 ```
+
+### Configuration File
+
+Create `~/.occ/config.json` for persistent settings:
+
+```json
+{
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-20250514",
+  "permissions": "auto",
+  "anthropicApiKey": "sk-ant-...",
+  "openaiApiKey": "sk-...",
+  "openaiBaseUrl": "http://localhost:11434/v1"
+}
+```
+
+Environment variables override config file values. All fields are optional.
 
 ### MCP Server Configuration
 

@@ -1,18 +1,46 @@
 {
-  "name": "open-claude-code",
-  "version": "0.1.0",
-  "description": "The essence of Claude Code in ~3000 lines. Streaming tool execution, multi-provider, hackable.",
+  "name": "open-claudecode",
+  "version": "0.5.0",
+  "description": "Open-source coding agent inspired by Claude Code. Multi-provider (Anthropic/OpenAI/Ollama), streaming tool execution, MCP support.",
   "type": "module",
+  "main": "./dist/index.js",
   "bin": {
-    "occ": "./src/index.ts"
+    "occ": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "claude-code",
+    "coding-agent",
+    "cli",
+    "ai",
+    "openai",
+    "anthropic",
+    "mcp",
+    "tool-use",
+    "ollama",
+    "multi-provider"
+  ],
+  "author": "sdliu",
+  "homepage": "https://github.com/LikiosSedo/open-claudecode",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LikiosSedo/open-claudecode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LikiosSedo/open-claudecode/issues"
   },
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
+    "build": "tsup",
+    "prepublishOnly": "npm run build && npm test",
     "test": "vitest run"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
+    "@anthropic-ai/sdk": "^0.82.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chalk": "^5.4.0",
     "glob": "^11.0.0",
@@ -23,6 +51,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.7.0",
     "vitest": "^4.1.2"
   },

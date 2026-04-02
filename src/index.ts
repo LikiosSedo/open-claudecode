@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * open-claude-code (occ) — The essence of Claude Code
  *
@@ -11,9 +10,39 @@
  */
 
 import * as readline from 'node:readline'
-import { readFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+
+// --- User Config: ~/.occ/config.json ---
+
+export interface OccConfig {
+  provider?: 'anthropic' | 'openai'
+  apiKey?: string
+  baseUrl?: string
+  model?: string
+  permissions?: 'auto' | 'ask' | 'bypass'
+  sandbox?: boolean
+}
+
+const CONFIG_DIR = join(homedir(), '.occ')
+const CONFIG_PATH = join(CONFIG_DIR, 'config.json')
+
+function loadConfig(): OccConfig {
+  try {
+    if (existsSync(CONFIG_PATH)) {
+      return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'))
+    }
+  } catch { /* ignore parse errors */ }
+  return {}
+}
+
+function saveConfig(config: OccConfig): void {
+  mkdirSync(CONFIG_DIR, { recursive: true })
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n')
+}
+
+const userConfig = loadConfig()
 import chalk from 'chalk'
 import { AnthropicProvider } from './providers/anthropic.js'
 import { OpenAIProvider } from './providers/openai.js'
@@ -108,16 +137,36 @@ function notifyCompletion(message: string): void {
 // --- Provider Selection ---
 
 function createProvider(): { provider: Provider; defaultModel: string } {
-  if (process.env.ANTHROPIC_API_KEY) {
-    return { provider: new AnthropicProvider(), defaultModel: 'claude-sonnet-4-20250514' }
+  // Priority: config.json > env vars
+  // Config supports any OpenAI-compatible provider (Ollama, DeepSeek, Gemini, siflow, etc.)
+
+  const providerType = userConfig.provider ?? (process.env.ANTHROPIC_API_KEY ? 'anthropic' : 'openai')
+  const apiKey = userConfig.apiKey ?? process.env.ANTHROPIC_API_KEY ?? process.env.OPENAI_API_KEY
+  const baseUrl = userConfig.baseUrl ?? process.env.ANTHROPIC_BASE_URL ?? process.env.OPENAI_BASE_URL
+
+  if (!apiKey) {
+    console.error(chalk.red('  No API key configured.'))
+    console.error(chalk.dim(`  Run: occ /config   or edit ${CONFIG_PATH}`))
+    console.error(chalk.dim('  Example config:'))
+    console.error(chalk.dim('  {'))
+    console.error(chalk.dim('    "provider": "openai",'))
+    console.error(chalk.dim('    "apiKey": "sk-...",'))
+    console.error(chalk.dim('    "baseUrl": "https://api.siflow.cn/model-api",'))
+    console.error(chalk.dim('    "model": "moonshotai/Kimi-K2.5"'))
+    console.error(chalk.dim('  }'))
+    process.exit(1)
   }
-  if (process.env.OPENAI_API_KEY) {
-    return { provider: new OpenAIProvider(), defaultModel: 'gpt-4o' }
+
+  if (providerType === 'anthropic') {
+    return {
+      provider: new AnthropicProvider({ apiKey, baseURL: baseUrl }),
+      defaultModel: 'claude-sonnet-4-20250514',
+    }
   }
-  console.error(chalk.red(
-    'No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.',
-  ))
-  process.exit(1)
+  return {
+    provider: new OpenAIProvider({ apiKey, baseURL: baseUrl }),
+    defaultModel: userConfig.model ?? 'gpt-4o',
+  }
 }
 
 // --- Tool Registration ---
@@ -694,7 +743,35 @@ async function main() {
       prompt()
       return
     }
+    if (input === '/config') {
+      console.log(chalk.yellow(`  Config: ${CONFIG_PATH}`))
+      console.log(chalk.dim(JSON.stringify(userConfig, null, 2).split('\n').map(l => '  ' + l).join('\n')))
+      console.log()
+      console.log(chalk.dim('  Edit directly or use:'))
+      console.log(chalk.dim('  /config set provider openai'))
+      console.log(chalk.dim('  /config set apiKey sk-...'))
+      console.log(chalk.dim('  /config set baseUrl https://api.siflow.cn/model-api'))
+      console.log(chalk.dim('  /config set model moonshotai/Kimi-K2.5'))
+      prompt()
+      return
+    }
+    if (input.startsWith('/config set ')) {
+      const parts = input.slice('/config set '.length).split(/\s+/)
+      const key = parts[0] as keyof OccConfig
+      const value = parts.slice(1).join(' ')
+      if (!key || !value) {
+        console.log(chalk.red('  Usage: /config set <key> <value>'))
+      } else {
+        (userConfig as Record<string, unknown>)[key] = value === 'true' ? true : value === 'false' ? false : value
+        saveConfig(userConfig)
+        console.log(chalk.yellow(`  ${key} → ${value}`))
+        console.log(chalk.dim('  Restart occ to apply changes.'))
+      }
+      prompt()
+      return
+    }
     if (input === '/help') {
+      console.log(chalk.dim('  /config      show/edit provider config'))
       console.log(chalk.dim('  /exit        quit'))
       console.log(chalk.dim('  /clear       clear conversation'))
       console.log(chalk.dim('  /compact     compact conversation context'))

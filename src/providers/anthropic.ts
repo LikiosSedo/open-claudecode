@@ -123,8 +123,8 @@ export class AnthropicProvider implements Provider {
               usage: {
                 inputTokens: usage.input_tokens,
                 outputTokens: usage.output_tokens,
-                cacheReadTokens: (usage as Record<string, number>).cache_read_input_tokens,
-                cacheWriteTokens: (usage as Record<string, number>).cache_creation_input_tokens,
+                cacheReadTokens: (usage as unknown as Record<string, number>).cache_read_input_tokens,
+                cacheWriteTokens: (usage as unknown as Record<string, number>).cache_creation_input_tokens,
               },
             }
             break
@@ -160,7 +160,7 @@ export class AnthropicProvider implements Provider {
           case 'content_block_delta': {
             const partial = partialBlocks.get(event.index)
             if (!partial) break
-            const delta = event.delta as Record<string, string>
+            const delta = event.delta as unknown as Record<string, string>
 
             if (delta.type === 'text_delta') {
               partial.text += delta.text
@@ -193,8 +193,8 @@ export class AnthropicProvider implements Provider {
           }
 
           case 'message_delta': {
-            const delta = event.delta as Record<string, string>
-            const usage = (event as Record<string, unknown>).usage as Record<string, number> | undefined
+            const delta = event.delta as unknown as Record<string, string>
+            const usage = (event as unknown as Record<string, unknown>).usage as Record<string, number> | undefined
             yield {
               type: 'message_stop',
               stopReason: (delta.stop_reason ?? 'end_turn') as StopReason,
