@@ -30,6 +30,8 @@ export type { TraceEvent, TraceCallback } from './trace.js'
 export { consoleTracer } from './trace.js'
 export type { Tool, ToolResult, ToolContext } from './tools/types.js'
 export type { Provider, Message } from './providers/types.js'
+export { AgentGraph, agentNode, END } from './graph.js'
+export type { GraphState, GraphEvent, NodeFunction, EdgeCondition } from './graph.js'
 
 // -- Coding preset --
 
