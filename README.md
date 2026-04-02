@@ -135,7 +135,106 @@ MCP tools are automatically deferred and discoverable via ToolSearch.
 | `/exit` | Quit |
 | `Ctrl+C` | Interrupt current request (won't exit) |
 
+## Use as SDK
+
+open-claude-cli is also a general-purpose agent engine. Import the `Agent` class to build any kind of agent:
+
+```typescript
+import { Agent } from 'open-claude-cli/engine'
+
+const agent = new Agent({
+  provider: { model: 'gpt-4o', apiKey: process.env.OPENAI_API_KEY },
+  tools: [MyCustomTool],
+  systemPrompt: 'You are a helpful assistant.',
+})
+
+for await (const event of agent.run('Hello!')) {
+  if (event.type === 'text_delta') process.stdout.write(event.text)
+}
+```
+
+Or use the `query()` one-liner:
+
+```typescript
+import { query } from 'open-claude-cli/engine'
+
+for await (const event of query({
+  prompt: 'What files are here?',
+  tools: 'coding',  // preset: Bash, Read, Write, Edit, Glob, Grep
+})) {
+  if (event.type === 'text_delta') process.stdout.write(event.text)
+}
+```
+
+## Build Any Agent
+
+The engine is model- and domain-agnostic. Here are three examples:
+
+**Game NPC** — dialogue agent with inventory awareness:
+
+```typescript
+const npc = new Agent({
+  provider: { model: 'gpt-4o', apiKey: process.env.OPENAI_API_KEY },
+  tools: [InventoryTool, DialogueTool, QuestLogTool],
+  systemPrompt: 'You are Elara, a merchant in the village square.',
+})
+for await (const ev of npc.run('What potions do you have?')) { /* ... */ }
+```
+
+**SRE Bot** — incident responder with runbook tools:
+
+```typescript
+const sre = new Agent({
+  provider: { model: 'claude-sonnet-4-20250514' },
+  tools: [KubectlTool, GrafanaTool, PagerDutyTool],
+  systemPrompt: 'You are an SRE on-call bot. Diagnose and mitigate incidents.',
+})
+for await (const ev of sre.run('Pod crash-looping in prod-us-east')) { /* ... */ }
+```
+
+**Data Analyst** — SQL + charting agent:
+
+```typescript
+const analyst = new Agent({
+  provider: { model: 'llama3', baseUrl: 'http://localhost:11434/v1', apiKey: 'ollama' },
+  tools: [SQLQueryTool, ChartTool, ExportCSVTool],
+  systemPrompt: 'You are a data analyst. Query the warehouse and visualize results.',
+})
+for await (const ev of analyst.run('Monthly revenue trend for Q1')) { /* ... */ }
+```
+
+See [`examples/`](./examples/) for full runnable code.
+
+## vs Claude Agent SDK
+
+| | Claude Agent SDK | open-claude-cli |
+|---|---|---|
+| Models | Claude only | Any (OpenAI, Ollama, Groq, LM Studio, etc.) |
+| Custom tools | Limited (Claude-defined) | Full (bring your own `Tool` interface) |
+| MCP support | Yes | Yes (stdio transport) |
+| Streaming | Yes | Yes (per-tool streaming + concurrent execution) |
+| Sub-agents | Yes | Yes (depth-limited fork) |
+| Permission system | N/A | auto / ask / bypass + hooks |
+| Session persistence | Managed by Anthropic | Local (self-hosted) |
+| Context compaction | N/A | Built-in (truncate + LLM summary) |
+| License | Commercial | MIT |
+| Runs locally | No (API-only) | Yes |
+
 ## Architecture
+
+```
+  Your App                     open-claude-cli
+  (game/SRE/data)             (coding agent)
+        \                          /
+         +------ Agent Engine ----+
+         | agentLoop + StreamingToolExecutor |
+         | Providers (Anthropic/OpenAI/any)  |
+         | Permissions · Hooks · Memory      |
+         | Context · Session · MCP           |
+         +----------------------------------+
+```
+
+### Internal Architecture
 
 ```
                     +-----------+
