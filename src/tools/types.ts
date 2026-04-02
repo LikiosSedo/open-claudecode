@@ -40,6 +40,15 @@ export interface Tool<TInput = unknown> {
   /** Does this tool only read, never write? */
   isReadOnly: boolean
 
+  /**
+   * Optional semantic validation before execution.
+   * Called after Zod schema validation passes but before permission check.
+   * Use for dynamic checks: path permissions, value ranges, state preconditions.
+   * Design from Claude Code's Tool.validateInput().
+   */
+  validateInput?: (input: TInput, context: ToolContext) => Promise<{ valid: boolean; error?: string }>
+
+
   /** Pre-computed JSON Schema (used by MCP tools that already have JSON Schema) */
   rawJsonSchema?: Record<string, unknown>
 

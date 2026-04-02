@@ -597,6 +597,17 @@ export async function* agentLoop(
 
           contentBlocks.push({ type: 'tool_use', id: event.id, name: toolName, input })
 
+          // Semantic validation (Tool.validateInput) — before permission check
+          const toolDef = tools.get(toolName)
+          if (toolDef?.validateInput) {
+            const validation = await toolDef.validateInput(input, toolContext)
+            if (!validation.valid) {
+              executor.addDeniedTool(event.id, toolName, `Validation failed: ${validation.error ?? 'invalid input'}`)
+              yield { type: 'tool_start', name: toolName, id: event.id }
+              break
+            }
+          }
+
           // Permission check before execution (async — may prompt user)
           if (permissionCheck) {
             const decision = await permissionCheck(toolName, input)
